@@ -1,0 +1,18 @@
+/target/
+/dist/
+/.runtime/
+*.DS_Store
+
+# Local credentials and environment overrides
+.env
+.env.*
+!.env.example
+!.env.template
+
+# Local research projects and exported bundles
+.theory-studio/
+*.theorybundle
+
+# Python fixture caches
+__pycache__/
+*.pyc

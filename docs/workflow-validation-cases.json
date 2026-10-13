@@ -1,0 +1,10 @@
+[
+  {"id":"concept","question":"Metastability와 multistability를 구분해 줘. 새로운 이론은 만들지 마.","checks":["No constructor needed","Definitions remain context dependent"]},
+  {"id":"evidence","question":"이 논문으로 세포 변화가 행동 상태 전환을 일으킨다고 써도 될까?","checks":["Exact source hash, quote and line range","No metadata-only support"]},
+  {"id":"comparison","question":"학습 후 행동 변화를 설명하는 두 이론을 비교해 줘.","checks":["Shared evaluation targets","Symmetric scope and assumption burden"]},
+  {"id":"mechanism","question":"활동 의존적 가소성과 느린 조절 과정의 기제 후보를 제안해 줘.","checks":["Independent base contexts","Distinct mechanisms or assumptions"]},
+  {"id":"multilevel","question":"회로 상태 공간과 긴 시간 규모의 기분 경과를 연결해 줘.","checks":["Explicit mapping and time scales","No biological proof from toy models"]},
+  {"id":"formalization","question":"최소 모형의 변수와 식, 성립 조건을 정리해 줘.","checks":["No claim of numerical execution","Units and boundary assumptions"]},
+  {"id":"prediction","question":"두 학습 가설을 구분할 관찰은 무엇일까?","checks":["Measurement and confounders","Allow observational equivalence"]},
+  {"id":"revision","question":"선택한 가정을 빼고 다시 검토해 줘. 새 가정으로 살리지는 마.","checks":["Only related ledger context","Preserve invalidated conclusions and previous revisions"]}
+]
