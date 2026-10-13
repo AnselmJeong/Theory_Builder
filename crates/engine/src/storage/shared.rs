@@ -395,27 +395,64 @@ pub(super) fn extract(path: &Path, ext: &str, bytes: &[u8], cancel: &Cancel) -> 
             .unwrap_or_else(|e| (String::new(), format!("본문 추출 실패: {e}")));
     }
     if ext == "pdf" {
-        let result = (|| -> Result<(String, String)> {
-            let exe = std::env::current_exe()?;
-            let bundled = exe
-                .parent()
-                .unwrap()
-                .join("../Resources/bin/theory-extract");
-            let helper = if bundled.is_file() {
-                bundled
-            } else {
-                PathBuf::from(env!("THEORY_EXTRACT_BUILD"))
-            };
-            let mut cmd = isolated_command(&helper, path.parent().unwrap());
-            cmd.arg(path);
-            let raw = Process::text(cmd, cancel, Instant::now() + Duration::from_secs(40), None)?;
-            let v: serde_json::Value = serde_json::from_str(&raw)?;
-            Ok((
-                v["text"].as_str().unwrap_or_default().into(),
-                v["note"].as_str().unwrap_or_default().into(),
-            ))
-        })();
+        let result = match pdfkit_helper() {
+            Some(helper) => (|| -> Result<(String, String)> {
+                let mut cmd = isolated_command(&helper, path.parent().unwrap());
+                cmd.arg(path);
+                let raw =
+                    Process::text(cmd, cancel, Instant::now() + Duration::from_secs(40), None)?;
+                let v: serde_json::Value = serde_json::from_str(&raw)?;
+                Ok((
+                    v["text"].as_str().unwrap_or_default().into(),
+                    v["note"].as_str().unwrap_or_default().into(),
+                ))
+            })(),
+            None => pdftotext(path, cancel),
+        };
         return result.unwrap_or_else(|e| (String::new(), format!("본문 추출 실패: {e}")));
     }
     (String::new(), "본문 추출 미지원 · 원본 열기 가능".into())
+}
+/// macOS: the PDFKit helper bundled in the app or built by build.rs.
+fn pdfkit_helper() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let bundled = exe.parent()?.join("../Resources/bin/theory-extract");
+    if bundled.is_file() {
+        return Some(bundled);
+    }
+    option_env!("THEORY_EXTRACT_BUILD")
+        .map(PathBuf::from)
+        .filter(|p| p.is_file())
+}
+/// Other platforms: poppler's `pdftotext`, with the same page markers as the PDFKit helper.
+fn pdftotext(path: &Path, cancel: &Cancel) -> Result<(String, String)> {
+    let exe = crate::providers::process::executable("pdftotext", "")
+        .context("PDF 본문을 읽으려면 poppler의 pdftotext가 필요합니다")?;
+    let mut cmd = isolated_command(&exe, path.parent().unwrap_or(Path::new("/")));
+    cmd.args(["-enc", "UTF-8", "-q"]).arg(path).arg("-");
+    let raw = Process::text(cmd, cancel, Instant::now() + Duration::from_secs(60), None)?;
+    let pages: Vec<_> = raw.split('\u{c}').collect();
+    let mut text = String::new();
+    let (mut read, mut nonempty) = (0, 0);
+    for (i, page) in pages.iter().enumerate() {
+        if text.len() + page.len() > 2_000_000 {
+            break;
+        }
+        read += 1;
+        if !page.trim().is_empty() {
+            nonempty += 1;
+            text.push_str(&format!("[PDF page {}]\n{}\n\n", i + 1, page.trim_end()));
+        }
+    }
+    let total = pages.iter().filter(|p| !p.is_empty()).count().max(read);
+    Ok((
+        text,
+        if nonempty == 0 {
+            "텍스트 없음 · 스캔 PDF는 OCR이 필요합니다".into()
+        } else {
+            format!(
+                "PDF 텍스트 추출 (pdftotext) · {read}/{total}페이지 확인 · 텍스트 있는 페이지 {nonempty} · 페이지 표식 포함"
+            )
+        },
+    ))
 }

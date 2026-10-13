@@ -137,6 +137,26 @@ fn serve(
         Ok(())
     };
     snapshot(&store, &settings)?;
+    // Connection state is shown from the start; checking it must not hold the UI.
+    {
+        let (root, settings, updates) = (root.clone(), settings.clone(), updates.clone());
+        std::thread::spawn(move || {
+            let quiet: Cancel = Arc::new(AtomicBool::new(false));
+            for p in [ProviderKind::Claude, ProviderKind::Codex] {
+                let c = Subscriptions::new(&root, settings.clone())
+                    .inspect(p, &quiet)
+                    .unwrap_or_else(|e| Connection {
+                        provider: p.label().into(),
+                        installed: !e.to_string().contains("찾지 못했습니다"),
+                        message: e.to_string(),
+                        ..Default::default()
+                    });
+                if updates.send(Event::Connection(c)).is_err() {
+                    break;
+                }
+            }
+        });
+    }
     if store.project.workspace_folder.is_some() {
         updates.send(Event::Background(true))?;
         if let Err(e) = store.sync_resources(cancel, &mut |s| {
@@ -167,7 +187,6 @@ fn serve(
                     }
                     updates.send(Event::Background(false))?;
                 }
-                snapshot(&store, &settings)?;
                 continue;
             }
         };
@@ -187,7 +206,7 @@ fn serve(
             match command {
                 Command::NewProject(title) => {
                     ensure!(!title.trim().is_empty(), "프로젝트 제목을 입력하세요");
-                    store = if root == data_directory() {
+                    store = if root == data_directory() && scholarpen_root().is_dir() {
                         let name = title.replace(['/', ':', '\\'], "-");
                         ensure!(
                             !name.trim().is_empty() && name != "." && name != "..",
@@ -378,13 +397,9 @@ fn serve(
                     if source.asset_hash.is_none()
                         && crate::search::safe_public_url(&source.locator)
                     {
-                        std::process::Command::new("/usr/bin/open")
-                            .arg(&source.locator)
-                            .spawn()?;
+                        crate::platform::open_external(&source.locator)?;
                     } else {
-                        std::process::Command::new("/usr/bin/open")
-                            .arg(store.source_path(&id)?)
-                            .spawn()?;
+                        crate::platform::open_external(store.source_path(&id)?)?;
                     }
                 }
                 Command::Settings(mut s) => {

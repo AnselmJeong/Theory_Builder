@@ -280,7 +280,7 @@ pub fn retrieve(
     let client = Client::builder()
         .timeout(Duration::from_secs(35))
         .redirect(reqwest::redirect::Policy::none())
-        .user_agent("TheoryStudio/0.2 literature research")
+        .user_agent("TheoryStudio/0.3 literature research")
         .build()?;
     let key = tinyfish_key();
     let mut result = SearchResults {

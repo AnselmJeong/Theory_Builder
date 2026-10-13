@@ -1,3 +1,29 @@
+# v0.3 검증 기록 — 2026-10-13
+
+이 절은 Linux 클라우드 환경에서 수행한 v0.3 검증이다. 아래 v0.2·v0.1 기록은 당시 기록으로 보존한다. 변경 내용과 진단은 [diagnosis-v0.3.md](diagnosis-v0.3.md)를 본다.
+
+## 자동 검증
+
+`cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings` 통과. `cargo test --workspace`: **54개 통과** (core 8, engine 단위 15, 토론 7, 공유 폴더 7, 실행·저장 14, GPUI 3).
+
+- 토론(`crates/engine/tests/deliberation.rs`, fixture provider): GPT 구성 · Claude 비판 교대 순서, 1회 수정 후 수렴, 비판 이력(응답 → 판정), 저자가 넣은 판정 무시, 원장에는 수정된 마지막 판본만, 모델이 namespace 밖에 만든 ID 재부여와 인용 참조 갱신, 같은 이견 2회 유지 → "진전 없음" 종료와 원장 '이견 있음', 빠르게 범위(수정 0회), 서버 혼잡 1회 재시도, 비판 모델 로그인 실패 시 대체 호출 없음 + 부분 답변, 재시도로 호출이 모자랄 때 단계 보류 후 종합, Markdown 내보내기의 토론 기록·비판 원장.
+- core: 항목 단위 격리(가짜 인용·전송 범위 밖 인용 제외, 없는 의존·수정 대상 해제, 순환 제거, 심각도 정규화), ID namespace 재부여, 수정 판본 연결의 head 계산, strict 스키마(새 필드 포함 모든 속성 required).
+- 실행·저장: 기존 회귀 + 출처 40개를 요청 한도 안에 배분.
+- GPUI(실제 컴포넌트): 프로젝트 대화상자에서 한국어 제목 입력·생성, 예시 질문, 한국어 입력과 일반 Enter 비실행, 검토 패널, 자동 저장 전 프로젝트 전환 시 초안 보존, 실제 엔진이 만든 토론 실행의 모든 단계 렌더와 비판 경과 열기.
+  - 원래 테스트는 대화상자 열림 애니메이션 도중 클릭해 입력이 들어가지 않았다(이 환경에서 원본 코드로 재현). 테스트 시계를 진행시켜 애니메이션이 끝난 뒤 조작하도록 고쳤다.
+
+## 실제 창
+
+Xvfb + Mesa에서 실제 GPUI 창을 띄우고 xdotool로 클릭해 첫 화면, 프로젝트 대화상자, 답변·토론·근거·작업 기록 탭, 주장·가정, 자료, 설정, 원문·비판 검토 패널, 다크 모드를 확인했다. 데모 데이터는 `demo_project` 예제의 스크립트 응답(가상)이다. 설정 화면은 이 환경의 실제 상태(Claude Code CLI 설치·미로그인, Codex CLI 없음)를 표시했다.
+
+## 미검증
+
+- 실제 Claude·Codex 구독 호출. 이 환경에 로그인이 없다. Claude Code CLI 2.1.296의 플래그(`--safe-mode`, `--json-schema`, `--tools`, `--setting-sources`, `--no-session-persistence`, `--disable-slash-commands`)가 존재함은 `claude --help`로 확인했다.
+- 실제 모델이 새 `critique_responses`/`critique_reviews` 계약을 지키는 정도와 토론의 연구 품질.
+- macOS 빌드·번들·서명과 PDFKit 경로(Linux에서 작업). Linux `pdftotext` 경로는 컴파일만 확인했다.
+
+---
+
 # v0.2 검증 기록 — 2026-10-13
 
 이 절은 아래 v0.1 기록을 갱신한다. 과거 실패와 미검증 상태는 당시 기록으로 보존했다.

@@ -12,14 +12,7 @@ use std::{
 };
 use theory_core::*;
 
-pub fn data_directory() -> PathBuf {
-    std::env::var_os("THEORY_STUDIO_DATA_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            PathBuf::from(std::env::var_os("HOME").unwrap_or_default())
-                .join("Library/Application Support/Theory Studio")
-        })
-}
+pub use crate::platform::data_directory;
 pub fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
     let parent = path.parent().context("상위 경로 없음")?;
     fs::create_dir_all(parent)?;
@@ -446,6 +439,69 @@ pub fn markdown(p: &Project) -> String {
         for l in &r.limitations {
             out.push_str(&format!("- 한계: {l}\n"));
         }
+        let who = |label: &str| crate::providers::ProviderKind::from_label(label).display();
+        let d = &r.deliberation;
+        if !d.author.is_empty() {
+            out.push_str(&format!(
+                "\n### 토론 기록\n\n구성 {} · 비판 {} · 수정 {}회{}\n\n",
+                who(&d.author),
+                who(&d.critic),
+                d.rounds,
+                d.stop
+                    .map(|s| format!(" · {}", s.label()))
+                    .unwrap_or_default()
+            ));
+            for a in r
+                .attempts
+                .iter()
+                .filter(|a| a.state == TaskState::Succeeded)
+            {
+                if let (Some(phase), Some(o)) = (a.phase, &a.output)
+                    && phase != Phase::Plan
+                {
+                    let step = if a.round > 0 {
+                        format!("{}차 {}", a.round, phase.label())
+                    } else {
+                        phase.label().to_string()
+                    };
+                    out.push_str(&format!(
+                        "- **{} · {step}**: {}\n",
+                        who(&a.provider),
+                        o.summary.lines().next().unwrap_or_default()
+                    ));
+                }
+            }
+        }
+        if !r.critiques.is_empty() {
+            out.push_str("\n### 비판 원장\n\n");
+            for c in &r.critiques {
+                out.push_str(&format!(
+                    "- **{}** [{} · {}] {} (대상 `{}`, {} 제기)\n",
+                    c.id,
+                    c.critique.severity,
+                    c.status.label(),
+                    c.critique.reasoning,
+                    if c.critique.target_id.is_empty() {
+                        "초안 전체"
+                    } else {
+                        &c.critique.target_id
+                    },
+                    who(&c.provider)
+                ));
+                for e in &c.events {
+                    out.push_str(&format!(
+                        "  - {}차 {} {}: {}\n",
+                        e.round,
+                        who(&e.provider),
+                        e.stance
+                            .map(|s| s.label())
+                            .or(e.status.map(|s| s.label()))
+                            .unwrap_or_default(),
+                        e.reasoning
+                    ));
+                }
+            }
+        }
         for a in &r.attempts {
             if let Some(o) = &a.output {
                 for e in &o.evidence_refs {
@@ -461,11 +517,14 @@ pub fn markdown(p: &Project) -> String {
                         e.reasoning
                     ));
                 }
-                for c in &o.critiques {
-                    out.push_str(&format!(
-                        "\n- 미해결 비판 / {} / {}: {}\n",
-                        c.target_id, c.severity, c.reasoning
-                    ));
+                // Runs before the critique ledger existed kept critiques only in outputs.
+                if r.critiques.is_empty() {
+                    for c in &o.critiques {
+                        out.push_str(&format!(
+                            "\n- 미해결 비판 / {} / {}: {}\n",
+                            c.target_id, c.severity, c.reasoning
+                        ));
+                    }
                 }
             }
         }

@@ -19,11 +19,28 @@ impl Budget {
             Self::Deep => 24,
         }
     }
+    /// Wall-clock limit. Debate rounds take two calls each, so these exceed the
+    /// plan's first proposal (5/15/30 min); a round only starts if it can finish.
     pub fn seconds(self) -> u64 {
         match self {
-            Self::Quick => 300,
-            Self::Standard => 900,
-            Self::Deep => 1800,
+            Self::Quick => 480,
+            Self::Standard => 1500,
+            Self::Deep => 3000,
+        }
+    }
+    /// Maximum author-revision ↔ critic-review rounds after the first critique.
+    pub fn rounds(self) -> u32 {
+        match self {
+            Self::Quick => 0,
+            Self::Standard => 2,
+            Self::Deep => 4,
+        }
+    }
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Quick => "빠르게",
+            Self::Standard => "표준",
+            Self::Deep => "깊게",
         }
     }
     pub fn label(self) -> &'static str {
@@ -31,6 +48,13 @@ impl Budget {
             Self::Quick => "빠르게 · 4회",
             Self::Standard => "표준 · 12회",
             Self::Deep => "깊게 · 24회",
+        }
+    }
+    pub fn detail(self) -> &'static str {
+        match self {
+            Self::Quick => "호출 4회 · 8분 · 비판 1회, 수정 없음",
+            Self::Standard => "호출 12회 · 25분 · 비판↔수정 최대 2회",
+            Self::Deep => "호출 24회 · 50분 · 비판↔수정 최대 4회",
         }
     }
 }

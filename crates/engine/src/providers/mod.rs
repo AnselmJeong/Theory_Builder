@@ -19,10 +19,31 @@ pub enum ProviderKind {
     Claude,
 }
 impl ProviderKind {
+    /// Stable identifier stored in attempts and settings.
     pub fn label(self) -> &'static str {
         match self {
             Self::Codex => "Codex",
             Self::Claude => "Claude",
+        }
+    }
+    /// What the researcher sees: the model family, not the transport.
+    pub fn display(self) -> &'static str {
+        match self {
+            Self::Codex => "GPT",
+            Self::Claude => "Claude",
+        }
+    }
+    pub fn other(self) -> Self {
+        match self {
+            Self::Codex => Self::Claude,
+            Self::Claude => Self::Codex,
+        }
+    }
+    pub fn from_label(label: &str) -> Self {
+        if label == Self::Claude.label() {
+            Self::Claude
+        } else {
+            Self::Codex
         }
     }
 }

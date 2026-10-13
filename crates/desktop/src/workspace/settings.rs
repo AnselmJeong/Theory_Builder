@@ -1,5 +1,5 @@
 use super::*;
-use gpui_kit::component::{checkbox::Checkbox, radio::RadioGroup};
+use gpui_kit::component::radio::RadioGroup;
 impl Workspace {
     pub(super) fn open_settings(&mut self, cx: &mut Context<Self>) {
         self.page = Page::Settings;
@@ -51,112 +51,295 @@ impl Workspace {
     }
     pub(super) fn settings_view(&self, cx: &mut Context<Self>) -> AnyElement {
         let busy = self.busy();
-        let mut body=v_flex().gap_5().child(div().text_xl().font_weight(FontWeight::SEMIBOLD).child("설정")).child(muted("선택한 자료 구절·관련 원장·선행 작업 출력이 구독 provider로 전송됩니다. 인증 정보는 프로젝트와 내보내기에 포함되지 않습니다.",cx))
-            .child(v_flex().gap_2().child("기본 구독").child(RadioGroup::new("primary-provider").children(["Codex · ChatGPT 구독","Claude · Claude Code 구독"]).selected_index(Some(if self.settings.primary==ProviderKind::Codex{0}else{1})).on_change(cx.listener(|this,ix,_,cx|{if this.busy(){return;}this.settings.primary=if *ix==0{ProviderKind::Codex}else{ProviderKind::Claude};this.save_settings(cx);}))))
-            .child(Checkbox::new("cross-review").label("비판 검토에 다른 구독 사용 (두 계정 연결 필요)").checked(self.settings.cross_review).disabled(busy).on_change(cx.listener(|this,value,_,cx|{this.settings.cross_review = *value;this.save_settings(cx);})))
-            .child(muted("문헌 검색은 PubMed와 ScholarPen에 설정된 TinyFish 연결을 사용합니다. 질문에서 만든 검색어가 검색 서비스에 전달되며, 검색 사용량은 해당 서비스 정책을 따릅니다.",cx)).child(muted("API 결제로 자동 전환하지 않습니다. 계정 사용량은 다른 앱과 공유하며, 남은 사용량을 알 수 없으면 ‘알 수 없음’으로 표시합니다.",cx));
-        for provider in [ProviderKind::Codex, ProviderKind::Claude] {
-            let name = provider.label();
-            let c = self.connections.iter().find(|c| c.provider == name);
-            let (model, path) = if provider == ProviderKind::Codex {
-                (&self.codex_model, &self.codex_path)
-            } else {
-                (&self.claude_model, &self.claude_path)
-            };
-            let mut section = v_flex()
-                .gap_3()
-                .pt_4()
-                .border_t_1()
-                .border_color(cx.theme().border)
-                .child(div().font_weight(FontWeight::SEMIBOLD).child(name))
-                .child(
-                    div()
-                        .font_weight(FontWeight::MEDIUM)
-                        .text_color(if c.is_some_and(|c| c.authenticated) {
-                            cx.theme().success
-                        } else {
-                            cx.theme().muted_foreground
-                        })
-                        .child(if c.is_some_and(|c| c.authenticated) {
-                            "연결됨 · 구독 인증 확인"
-                        } else {
-                            if c.is_none() { "연결 상태 조회 중" } else { "구독 연결 필요" }
-                        }),
-                )
-                .child(muted(
-                    c.map(|c| c.message.clone())
-                        .unwrap_or_else(|| "설치된 CLI의 구독 인증을 확인합니다. 실행 중이라면 완료 후 연결 확인을 누르세요.".into()),
-                    cx,
-                ))
-                .child(
-                    h_flex()
-                        .gap_2()
-                        .child(
-                            Button::new(SharedString::from(format!("inspect-{name}")))
-                                .label("연결 확인")
-                                .disabled(busy)
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.connection_action(provider, false, cx)
-                                })),
-                        )
-                        .child(
-                            Button::new(SharedString::from(format!("login-{name}")))
-                                .label("구독 로그인…")
-                                .disabled(busy)
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.connection_action(provider, true, cx)
-                                })),
-                        ),
-                )
-                .child(
-                    h_flex().child(
+        let pairings = [
+            (ProviderKind::Claude, true, "Claude 구성 · GPT 비판"),
+            (ProviderKind::Codex, true, "GPT 구성 · Claude 비판"),
+            (ProviderKind::Claude, false, "Claude 단독 · 별도 문맥 비판"),
+            (ProviderKind::Codex, false, "GPT 단독 · 별도 문맥 비판"),
+        ];
+        let selected = pairings
+            .iter()
+            .position(|(p, x, _)| *p == self.settings.primary && *x == self.settings.cross_review);
+        let mut body = v_flex()
+            .gap_5()
+            .child(page_header(
+                "설정",
+                "선택한 자료 구절·관련 원장·이전 단계 출력이 구독 모델로 전송됩니다. 인증 정보는 프로젝트와 내보내기에 포함되지 않습니다.",
+                cx,
+            ))
+            .child(
+                card(cx)
+                    .gap_3()
+                    .child(div().font_weight(FontWeight::SEMIBOLD).child("토론 구성"))
+                    .child(muted(
+                        "구성 모델이 계획·초안·수정·종합을 맡고, 비판 모델이 비판과 판정을 맡습니다. 비판의 해소 여부는 비판 모델만 판정합니다. 두 모델의 합의는 경험적 근거가 아닙니다.",
+                        cx,
+                    ))
+                    .child(
+                        RadioGroup::new("pairing")
+                            .children(pairings.iter().map(|(_, _, l)| *l))
+                            .selected_index(selected)
+                            .on_change(cx.listener(move |this, ix: &usize, _, cx| {
+                                if this.busy() {
+                                    return;
+                                }
+                                let (p, x, _) = pairings[*ix];
+                                this.settings.primary = p;
+                                this.settings.cross_review = x;
+                                this.save_settings(cx);
+                            })),
+                    ),
+            )
+            .child(div().pt_2().font_weight(FontWeight::SEMIBOLD).child("모델 연결"));
+        for provider in [ProviderKind::Claude, ProviderKind::Codex] {
+            body = body.child(self.connection_card(provider, cx));
+        }
+        body = body
+            .child(
+                card(cx)
+                    .gap_3()
+                    .child(
+                        h_flex()
+                            .gap_3()
+                            .items_center()
+                            .child(div().flex_1().font_weight(FontWeight::SEMIBOLD).child("문헌 검색"))
+                            .child(
+                                Switch::new("settings-search")
+                                    .checked(self.settings.search_enabled)
+                                    .disabled(busy)
+                                    .on_click(cx.listener(|this, v: &bool, _, cx| {
+                                        this.settings.search_enabled = *v;
+                                        this.save_settings(cx);
+                                    })),
+                            ),
+                    )
+                    .child(muted(
+                        "계획 단계에서 만든 검색어(최대 2개)로 PubMed 초록과, ScholarPen에 TinyFish 연결이 있으면 웹 발췌를 가져옵니다. 검색 결과의 제목만으로는 근거로 쓰지 않습니다.",
+                        cx,
+                    )),
+            )
+            .child(
+                card(cx)
+                    .gap_3()
+                    .child(div().font_weight(FontWeight::SEMIBOLD).child("화면"))
+                    .child(
+                        h_flex()
+                            .gap_3()
+                            .items_center()
+                            .child(
+                                Switch::new("dark-mode")
+                                    .label("다크 모드")
+                                    .checked(self.settings.dark)
+                                    .on_click(cx.listener(|this, v: &bool, w, cx| {
+                                        this.settings.dark = *v;
+                                        Theme::change(
+                                            if *v { ThemeMode::Dark } else { ThemeMode::Light },
+                                            Some(w),
+                                            cx,
+                                        );
+                                        this.layout_changed = Some(Instant::now());
+                                        cx.notify();
+                                    })),
+                            )
+                            .child(div().flex_1())
+                            .child(muted("글자 크기", cx))
+                            .child(
+                                Button::new("zoom-out")
+                                    .small()
+                                    .icon(Icon::new(Lucide::Minus))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.settings.zoom =
+                                            this.settings.zoom.max(16).saturating_sub(1).max(12);
+                                        Theme::update(cx, |t| t.font_size = px(this.settings.zoom as f32));
+                                        this.layout_changed = Some(Instant::now());
+                                    })),
+                            )
+                            .child(div().text_sm().child(format!("{}", self.settings.zoom.max(16))))
+                            .child(
+                                Button::new("zoom-in")
+                                    .small()
+                                    .icon(Icon::new(Lucide::Plus))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.settings.zoom = (this.settings.zoom.max(16) + 1).min(22);
+                                        Theme::update(cx, |t| t.font_size = px(this.settings.zoom as f32));
+                                        this.layout_changed = Some(Instant::now());
+                                    })),
+                            ),
+                    ),
+            )
+            .child(
+                card(cx)
+                    .gap_3()
+                    .child(div().font_weight(FontWeight::SEMIBOLD).child("프로젝트"))
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .child(div().flex_1().child(Input::new(&self.new_title).id("rename-project-title")))
+                            .child(
+                                Button::new("rename-project")
+                                    .small()
+                                    .label("이름 변경")
+                                    .disabled(busy)
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.submit(
+                                            Command::Rename(this.new_title.read(cx).value().to_string()),
+                                            cx,
+                                        );
+                                    })),
+                            ),
+                    )
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .child(
+                                Button::new("settings-export")
+                                    .small()
+                                    .icon(Icon::new(Lucide::Share))
+                                    .label("내보내기…")
+                                    .disabled(busy)
+                                    .on_click(cx.listener(|this, _, _, cx| this.choose_path("export", cx))),
+                            )
+                            .child(
+                                Button::new("settings-import-bundle")
+                                    .small()
+                                    .ghost()
+                                    .label("bundle 가져오기…")
+                                    .disabled(busy)
+                                    .on_click(cx.listener(|this, _, _, cx| this.choose_path("bundle", cx))),
+                            ),
+                    ),
+            );
+        body.into_any_element()
+    }
+    fn connection_card(&self, provider: ProviderKind, cx: &mut Context<Self>) -> impl IntoElement {
+        let busy = self.busy();
+        let name = provider.label();
+        let c = self.connection(provider);
+        let (model, path) = if provider == ProviderKind::Codex {
+            (&self.codex_model, &self.codex_path)
+        } else {
+            (&self.claude_model, &self.claude_path)
+        };
+        let (status, color) = match c {
+            Some(c) if c.authenticated => ("연결됨", cx.theme().success),
+            Some(c) if !c.installed => ("CLI 없음", cx.theme().danger),
+            Some(_) => ("로그인 필요", gpui_kit::component::amber_500()),
+            None => ("확인 중", cx.theme().muted_foreground),
+        };
+        let mut section = card(cx)
+            .gap_3()
+            .child(
+                h_flex()
+                    .gap_2()
+                    .items_center()
+                    .child(avatar(name, cx))
+                    .child(
+                        v_flex()
+                            .flex_1()
+                            .child(
+                                div()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .child(provider.display()),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(if provider == ProviderKind::Codex {
+                                        "Codex CLI · 이 앱 전용 ChatGPT 구독 로그인"
+                                    } else {
+                                        "Claude Code CLI · 기존 Claude 구독 로그인"
+                                    }),
+                            ),
+                    )
+                    .child(chip(status, color)),
+            )
+            .child(muted(
+                c.map(|c| c.message.clone())
+                    .unwrap_or_else(|| "설치된 CLI의 구독 인증을 확인하고 있습니다.".into()),
+                cx,
+            ))
+            .child(
+                h_flex()
+                    .gap_2()
+                    .flex_wrap()
+                    .child(
+                        Button::new(SharedString::from(format!("inspect-{name}")))
+                            .small()
+                            .icon(Icon::new(Lucide::RefreshCw))
+                            .label("연결 확인")
+                            .disabled(busy)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.connection_action(provider, false, cx)
+                            })),
+                    )
+                    .child(
+                        Button::new(SharedString::from(format!("login-{name}")))
+                            .small()
+                            .label("구독 로그인…")
+                            .disabled(busy)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.connection_action(provider, true, cx)
+                            })),
+                    )
+                    .child(
                         Button::new(SharedString::from(format!("probe-{name}")))
                             .small()
-                            .label("응답 테스트 · 구독 호출 1회")
+                            .ghost()
+                            .label("응답 테스트 (호출 1회)")
                             .disabled(busy || !c.is_some_and(|c| c.authenticated))
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.save_settings(cx);
                                 this.service.cancel.store(false, Ordering::SeqCst);
                                 this.submit(Command::Probe(provider), cx);
                             })),
-                    ),
-                )
-                .child(
-                    v_flex()
-                        .gap_2()
-                        .child("모델 (비워 두면 계정 기본값)")
-                        .child(
+                    )
+                    .when(provider == ProviderKind::Codex, |v| {
+                        v.child(
+                            Button::new("logout-codex")
+                                .ghost()
+                                .small()
+                                .label("로그아웃")
+                                .disabled(busy)
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.service.cancel.store(false, Ordering::SeqCst);
+                                    this.submit(Command::LogoutCodex, cx);
+                                })),
+                        )
+                    }),
+            )
+            .child(
+                h_flex()
+                    .gap_2()
+                    .items_center()
+                    .child(div().w(rems(4.)).text_sm().child("모델"))
+                    .child(
+                        div().flex_1().child(
                             Input::new(model)
                                 .id(SharedString::from(format!("model-{name}")))
                                 .disabled(busy),
                         ),
-                )
-                .when(self.show_advanced, |v| {
-                    v.child(
-                        v_flex()
-                            .gap_2()
-                            .child("CLI 실행 파일 (비워 두면 자동 탐지)")
-                            .child(
-                                Input::new(path)
-                                    .id(SharedString::from(format!("path-{name}")))
-                                    .disabled(busy),
-                            ),
                     )
-                });
-            if let Some(c) = c {
-                section = section.when(self.show_advanced, |v| {
-                    v.child(muted(format!("실행 파일: {}", c.executable), cx))
-                });
+                    .child(
+                        Button::new(SharedString::from(format!("save-model-{name}")))
+                            .small()
+                            .label("저장")
+                            .disabled(busy)
+                            .on_click(cx.listener(|this, _, _, cx| this.save_settings(cx))),
+                    ),
+            );
+        if let Some(c) = c {
+            if !c.models.is_empty() {
                 let mut options = h_flex().flex_wrap().gap_1();
                 for slug in &c.models {
                     let slug = slug.clone();
-                    let label = slug.clone();
+                    let current = self.settings.model(provider) == slug;
                     options = options.child(
                         Button::new(SharedString::from(format!("model-option-{slug}")))
                             .ghost()
-                            .small()
-                            .justify_start()
-                            .label(label)
+                            .xsmall()
+                            .selected(current)
+                            .label(slug.clone())
                             .disabled(busy)
                             .on_click(cx.listener(move |this, _, w, cx| {
                                 let field = if provider == ProviderKind::Codex {
@@ -171,133 +354,58 @@ impl Workspace {
                     );
                 }
                 section = section.child(options);
-                section = section.child(document(
-                    SharedString::from(format!("quota-{name}")),
-                    if let Some(q) = &c.allowance {
-                        format!(
-                            "구독 포함 사용 허용: {}\n\n{}",
+            }
+            section = section.child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(match &c.allowance {
+                        Some(q) => format!(
+                            "구독 포함 사용: {} · {}",
                             match q["ordinaryUsageAllowed"].as_bool() {
-                                Some(true) => "예",
-                                Some(false) => "아니요",
+                                Some(true) => "허용",
+                                Some(false) => "허용 안 됨",
                                 None => "알 수 없음",
                             },
-                            quota_text(q)
-                        )
-                    } else {
-                        "남은 구독 사용량: 알 수 없음".into()
-                    },
-                ));
-            }
-            if provider == ProviderKind::Codex {
-                section = section.child(
-                    Button::new("logout-codex")
-                        .ghost()
-                        .small()
-                        .label("이 앱에서 로그아웃")
-                        .disabled(busy)
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.service.cancel.store(false, Ordering::SeqCst);
-                            this.submit(Command::LogoutCodex, cx);
-                        })),
-                )
-            } else {
-                section=section.child(muted("Claude Code의 기존 구독 로그인을 사용합니다. 계정의 추가 사용 설정은 Claude에서 관리합니다.",cx));
-            }
-            body = body.child(section);
+                            quota_text(q).replace('\n', " · ")
+                        ),
+                        None => "남은 구독 사용량: 알 수 없음 (자동 유료 전환 없음)".into(),
+                    }),
+            );
         }
-        body = body.child(
-            v_flex()
-                .gap_2()
-                .child("프로젝트 제목")
-                .child(Input::new(&self.new_title).id("rename-project-title"))
-                .child(
-                    Button::new("rename-project")
-                        .label("이름 변경")
-                        .disabled(busy)
+        section
+            .child(
+                h_flex().child(
+                    Button::new(SharedString::from(format!("advanced-{name}")))
+                        .ghost()
+                        .xsmall()
+                        .icon(Icon::new(if self.show_advanced {
+                            Lucide::ChevronDown
+                        } else {
+                            Lucide::ChevronRight
+                        }))
+                        .label("고급 설정")
                         .on_click(cx.listener(|this, _, _, cx| {
-                            this.submit(
-                                Command::Rename(this.new_title.read(cx).value().to_string()),
-                                cx,
-                            );
+                            this.show_advanced = !this.show_advanced;
+                            cx.notify();
                         })),
                 ),
-        );
-        body = body.child(
-            Button::new("advanced-connection")
-                .ghost()
-                .label(if self.show_advanced {
-                    "고급 연결 설정 닫기"
-                } else {
-                    "고급 연결 설정"
-                })
-                .on_click(cx.listener(|this, _, _, cx| {
-                    this.show_advanced = !this.show_advanced;
-                    cx.notify();
-                })),
-        );
-        body = body
-            .child(
-                h_flex()
-                    .gap_3()
-                    .child(
-                        Checkbox::new("dark-mode")
-                            .label("다크 모드")
-                            .checked(self.settings.dark)
-                            .on_change(cx.listener(|this, v, w, cx| {
-                                this.settings.dark = *v;
-                                Theme::change(
-                                    if *v {
-                                        ThemeMode::Dark
-                                    } else {
-                                        ThemeMode::Light
-                                    },
-                                    Some(w),
-                                    cx,
-                                );
-                                this.layout_changed = Some(Instant::now());
-                                cx.notify();
-                            })),
-                    )
-                    .child(
-                        Button::new("zoom-out")
-                            .small()
-                            .label("글자 −")
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.settings.zoom =
-                                    this.settings.zoom.max(16).saturating_sub(1).max(12);
-                                Theme::update(cx, |t| t.font_size = px(this.settings.zoom as f32));
-                                this.layout_changed = Some(Instant::now());
-                            })),
-                    )
-                    .child(
-                        Button::new("zoom-in")
-                            .small()
-                            .label("글자 +")
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.settings.zoom = (this.settings.zoom.max(16) + 1).min(22);
-                                Theme::update(cx, |t| t.font_size = px(this.settings.zoom as f32));
-                                this.layout_changed = Some(Instant::now());
-                            })),
-                    ),
             )
-            .child(
-                h_flex()
-                    .gap_3()
-                    .child(
-                        Button::new("save-settings")
-                            .primary()
-                            .label("연결 설정 저장")
-                            .disabled(busy)
-                            .on_click(cx.listener(|this, _, _, cx| this.save_settings(cx))),
-                    )
-                    .child(
-                        Button::new("import-bundle")
-                            .label("프로젝트 bundle 가져오기…")
-                            .disabled(busy)
-                            .on_click(cx.listener(|this, _, _, cx| this.choose_path("bundle", cx))),
-                    ),
-            );
-        body.into_any_element()
+            .when(self.show_advanced, |v| {
+                v.child(
+                    v_flex()
+                        .gap_2()
+                        .child(muted("CLI 실행 파일 (비워 두면 자동 탐지)", cx))
+                        .child(
+                            Input::new(path)
+                                .id(SharedString::from(format!("path-{name}")))
+                                .disabled(busy),
+                        )
+                        .when_some(c.map(|c| c.executable.clone()), |v, exe| {
+                            v.child(muted(format!("현재: {exe}"), cx))
+                        }),
+                )
+            })
     }
 }
 fn quota_text(q: &serde_json::Value) -> String {

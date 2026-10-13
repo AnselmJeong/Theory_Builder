@@ -54,7 +54,7 @@ impl CodexClient {
             scratch,
             executable,
         };
-        client.rpc("initialize",json!({"clientInfo":{"name":"theory_studio","title":"Theory Studio","version":"0.1.0"},"capabilities":{"experimentalApi":false}}),cancel,Instant::now()+Duration::from_secs(20))?;
+        client.rpc("initialize",json!({"clientInfo":{"name":"theory_studio","title":"Theory Studio","version":"0.3.0"},"capabilities":{"experimentalApi":false}}),cancel,Instant::now()+Duration::from_secs(20))?;
         client.process.send(&json!({"method":"initialized"}))?;
         Ok(client)
     }
@@ -182,9 +182,7 @@ impl CodexClient {
                 || url.starts_with("https://auth0.openai.com/"),
             "예상하지 못한 로그인 호스트"
         );
-        std::process::Command::new("/usr/bin/open")
-            .arg(url)
-            .spawn()?;
+        crate::platform::open_external(url)?;
         progress("브라우저에서 ChatGPT 로그인을 완료하세요. 이 앱 전용 로그인입니다.".into());
         let deadline = Instant::now() + Duration::from_secs(300);
         loop {
@@ -240,7 +238,7 @@ impl CodexClient {
             .to_string();
         let allowance = self.rpc("account/rateLimits/read", json!({}), cancel, deadline)?;
         check_allowance(&allowance, &slug)?;
-        let thread=self.rpc("thread/start",json!({"model":slug,"cwd":self.scratch,"approvalPolicy":"never","sandbox":"read-only","ephemeral":true,"baseInstructions":include_str!("../../../../resources/roles/research-v1.txt"),"serviceTier":"default"}),cancel,deadline)?;
+        let thread=self.rpc("thread/start",json!({"model":slug,"cwd":self.scratch,"approvalPolicy":"never","sandbox":"read-only","ephemeral":true,"baseInstructions":include_str!("../../../../resources/roles/research-v2.txt"),"serviceTier":"default"}),cancel,deadline)?;
         let thread_id = thread["thread"]["id"]
             .as_str()
             .context("thread ID 누락")?

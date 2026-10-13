@@ -99,7 +99,7 @@ pub fn generate(
         "--json-schema",
         &r.schema.to_string(),
         "--system-prompt",
-        include_str!("../../../../resources/roles/research-v1.txt"),
+        include_str!("../../../../resources/roles/research-v2.txt"),
     ]);
     if !r.model.is_empty() {
         cmd.args(["--model", &r.model]);

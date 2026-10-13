@@ -171,14 +171,30 @@ fn fabricated_quote_never_reaches_ledger() {
         &mut |_, _| {},
     )
     .unwrap();
-    assert!(store.project.entries.is_empty());
-    assert_eq!(store.project.runs[0].state, RunState::Partial);
+    let run = &store.project.runs[0];
+    // The invented quote is quarantined item by item; the rest of the analysis survives.
     assert!(
-        store.project.runs[0]
-            .attempts
+        run.attempts
             .iter()
-            .any(|a| a.state == TaskState::Failed)
+            .filter_map(|a| a.output.as_ref())
+            .flat_map(|o| &o.evidence_refs)
+            .all(|e| e.quote != "invented")
     );
+    let analysis = run
+        .attempts
+        .iter()
+        .find(|a| a.task_id == "analysis")
+        .unwrap();
+    assert_eq!(analysis.state, TaskState::Succeeded);
+    assert!(
+        analysis
+            .validation_notes
+            .iter()
+            .any(|n| n.contains("인용 제외"))
+    );
+    assert!(analysis.output.as_ref().unwrap().evidence_refs.is_empty());
+    assert_eq!(store.project.entries.len(), 1);
+    assert_eq!(run.state, RunState::Answered);
 }
 #[test]
 fn late_response_after_cancel_is_not_applied() {
@@ -374,6 +390,33 @@ fn synthesis_receives_transitive_candidates_and_live_progress() {
     )
     .unwrap();
     assert!(messages.iter().any(|m| m == "provider-progress-fixture"));
+}
+#[test]
+fn many_long_sources_are_packed_under_the_request_limit() {
+    let mut p = Project::new("packing");
+    let mut ids = vec![];
+    for i in 0..40 {
+        let body = format!("Paragraph about receptor {i} and plasticity.\n").repeat(800);
+        let s = Source::new(
+            format!("Paper {i}"),
+            body,
+            "pdf".into(),
+            Access::ProvidedText,
+        );
+        ids.push(s.id.clone());
+        p.sources.push(s);
+    }
+    let mut task = TaskSpec::new("read", Role::Analyst, "inspect");
+    task.source_ids = ids;
+    let mut r = Run::default();
+    r.id = id("run");
+    r.question = "plasticity receptor".into();
+    let c = task_context(&p, &r, &task);
+    assert!(c.to_string().len() < 200_000);
+    let sent = c["sources"].as_array().unwrap().len();
+    let omitted = c["omitted_sources"].as_array().unwrap().len();
+    assert_eq!(sent + omitted, 40);
+    assert!(sent >= 30);
 }
 #[test]
 fn long_source_passage_uses_question_and_preserves_original_line_numbers() {
