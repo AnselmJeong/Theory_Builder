@@ -221,6 +221,8 @@ pub(super) fn step_title(a: &Attempt) -> String {
         (Phase::Review, r) => format!("{r}차 재검토"),
         (Phase::Revise, r) => format!("{r}차 응답·수정"),
         (Phase::Synthesis, _) => "답변 종합".into(),
+        (Phase::Report, _) => "서기 · 읽기 쉬운 보고서".into(),
+        (Phase::Ask, _) => "서기 · 후속 질문 답변".into(),
     };
     format!("{} · {what}", who(&a.provider))
 }

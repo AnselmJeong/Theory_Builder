@@ -25,6 +25,10 @@ impl ModelProvider for Fixture {
         *self.calls.lock().unwrap() += 1;
         progress("provider-progress-fixture".into());
         let context: Value = serde_json::from_str(&r.prompt)?;
+        if context.get("request").is_some() {
+            // A malformed reader report: the research answer must survive it.
+            return Ok(Response::default_with_value(json!({"not":"a report"})));
+        }
         if context.get("task").is_none() {
             let source_ids = context["sources"]
                 .as_array()
@@ -139,7 +143,10 @@ fn full_run_persists_and_bundle_roundtrips() {
     )
     .unwrap();
     assert_eq!(store.project.runs[0].state, RunState::Answered);
-    assert_eq!(store.project.runs[0].calls, 4);
+    // Plan, analysis, review, synthesis and the (here malformed) reader report.
+    assert_eq!(store.project.runs[0].calls, 5);
+    assert!(store.project.runs[0].reading.is_none());
+    assert_eq!(store.project.runs[0].state, RunState::Answered);
     assert_eq!(store.project.entries.len(), 1);
     assert_eq!(store.project.entries[0].adoption, Adoption::Proposed);
     let id = store.project.id.clone();
@@ -150,11 +157,15 @@ fn full_run_persists_and_bundle_roundtrips() {
     let copy = Store::import_bundle(&dir.path().join("copy"), &bundle).unwrap();
     assert_eq!(copy.project.sources[0].hash, store.project.sources[0].hash);
     assert_eq!(copy.project.runs[0].report, store.project.runs[0].report);
-    assert!(
-        std::fs::read_to_string(bundle.join("report.md"))
-            .unwrap()
-            .contains("A change was observed.")
-    );
+    // The reader report never carries the user's documents; the short verified quote is
+    // kept only in the process appendix.
+    let report = std::fs::read_to_string(bundle.join("report/report.md")).unwrap();
+    assert!(report.contains("Synthetic study observed a change."));
+    assert!(!report.contains("No causal test was performed."));
+    let record = std::fs::read_to_string(bundle.join("report/debate-record.md")).unwrap();
+    assert!(record.contains("A change was observed."));
+    assert!(!record.contains("No causal test was performed."));
+    assert!(bundle.join("report/references.bib").is_file());
 }
 #[test]
 fn fabricated_quote_never_reaches_ledger() {
@@ -249,7 +260,7 @@ fn invalid_planner_falls_back_within_budget() {
         &mut |_, _| {},
     )
     .unwrap();
-    assert_eq!(store.project.runs[0].calls, 4);
+    assert_eq!(store.project.runs[0].calls, 5);
     assert!(
         store.project.runs[0]
             .limitations

@@ -54,7 +54,7 @@ impl CodexClient {
             scratch,
             executable,
         };
-        client.rpc("initialize",json!({"clientInfo":{"name":"theory_studio","title":"Theory Studio","version":"0.3.0"},"capabilities":{"experimentalApi":false}}),cancel,Instant::now()+Duration::from_secs(20))?;
+        client.rpc("initialize",json!({"clientInfo":{"name":"theory_studio","title":"Theory Studio","version":"0.4.0"},"capabilities":{"experimentalApi":false}}),cancel,Instant::now()+Duration::from_secs(20))?;
         client.process.send(&json!({"method":"initialized"}))?;
         Ok(client)
     }

@@ -6987,7 +6987,7 @@ dependencies = [
 
 [[package]]
 name = "theory-core"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "schemars",
@@ -6999,11 +6999,12 @@ dependencies = [
 
 [[package]]
 name = "theory-engine"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "fs2",
  "libc",
+ "markdown",
  "reqwest",
  "roxmltree 0.21.1",
  "rusqlite",
@@ -7018,7 +7019,7 @@ dependencies = [
 
 [[package]]
 name = "theory-studio"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "gpui-kit",

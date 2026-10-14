@@ -1,5 +1,6 @@
 mod content;
 mod progress;
+mod report_view;
 mod run_view;
 mod settings;
 mod style;
@@ -22,8 +23,10 @@ use gpui_kit::{
 };
 use progress::friendly_error;
 use std::{
+    cell::RefCell,
+    collections::HashMap,
     path::PathBuf,
-    sync::atomic::Ordering,
+    sync::{Arc, atomic::Ordering},
     time::{Duration, Instant},
 };
 use style::*;
@@ -32,7 +35,7 @@ use theory_core::*;
 use theory_engine::{
     providers::{Connection, ProviderKind, Settings},
     service::{Command, Event, Service, Snapshot},
-    storage::data_directory,
+    storage::{ReportScope, data_directory},
 };
 
 actions!(
@@ -57,10 +60,12 @@ enum Page {
     Settings,
     Direction,
 }
-/// Views of one question: the answer, the model exchange, the cited text, the raw record.
+/// Views of one question: the reader report, the working theory behind it, the model
+/// exchange, the cited text, the raw record.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum RunTab {
-    Answer,
+    Report,
+    Theory,
     Debate,
     Evidence,
     Log,
@@ -96,6 +101,15 @@ pub struct Workspace {
     new_title: Entity<InputState>,
     research_goal: Entity<TextareaState>,
     research_guidance: Entity<TextareaState>,
+    /// Follow-up question about the current report.
+    followup: Entity<TextareaState>,
+    /// Direction for continuing the current debate.
+    direction: Entity<TextareaState>,
+    continue_rounds: u32,
+    /// A question was run or continued from this window: open its report when it is done.
+    open_report_when_done: bool,
+    /// Rendered diagrams, by run, report version, figure and theme.
+    figure_cache: RefCell<HashMap<String, Arc<Image>>>,
     show_advanced: bool,
     show_excerpt_form: bool,
     last_clock: Instant,
@@ -147,6 +161,16 @@ impl Workspace {
                 .placeholder("이 프로젝트에서 설명하거나 알아내려는 현상")
         });
         let research_guidance = cx.new(|cx| TextareaState::new(window,cx).rows(5).placeholder("중시할 관점, 비교 기준, 범위와 제약을 자유롭게 적으세요. 비워 두면 질문에 맞춰 선택합니다."));
+        let followup = cx.new(|cx| {
+            TextareaState::new(window, cx)
+                .rows(2)
+                .placeholder("예: ‘끌개의 그림자’가 무슨 뜻인지 예를 들어 설명해 줘")
+        });
+        let direction = cx.new(|cx| {
+            TextareaState::new(window, cx).rows(2).placeholder(
+                "선택 · 예: 임상 가설을 더 구체적으로 만들어 줘 / 일주기 수준은 제외하고 회로 수준에 집중해 줘",
+            )
+        });
         let codex_model = cx.new(|cx| InputState::new(window, cx).placeholder("계정 기본 모델"));
         let claude_model =
             cx.new(|cx| InputState::new(window, cx).placeholder("Claude Code 계정 기본 모델"));
@@ -169,6 +193,18 @@ impl Workspace {
                 }
             }),
             cx.subscribe(&search, |_, _, _: &InputEvent, cx| cx.notify()),
+            cx.subscribe_in(&followup, window, |this, _, event, window, cx| {
+                if matches!(
+                    event,
+                    InputEvent::PressEnter {
+                        secondary: true,
+                        shift: false
+                    }
+                ) {
+                    this.ask_followup(window, cx);
+                }
+                cx.notify();
+            }),
         ];
         let ticker = cx.spawn_in(window, async move |this, cx| {
             loop {
@@ -188,12 +224,17 @@ impl Workspace {
             directory,
             research_goal,
             research_guidance,
+            followup,
+            direction,
+            continue_rounds: 2,
+            open_report_when_done: false,
+            figure_cache: RefCell::new(HashMap::new()),
             show_advanced: false,
             show_excerpt_form: false,
             last_clock: Instant::now(),
             snapshot: None,
             page: Page::Inquiry,
-            run_tab: RunTab::Answer,
+            run_tab: RunTab::Report,
             notes_filter: NotesFilter::All,
             inspector: Inspector::None,
             selected_run: None,
@@ -320,8 +361,9 @@ impl Workspace {
                     self.snapshot = Some(*s);
                 }
                 Event::Progress(p, status) => {
-                    if p.runs.last().map(|r| r.state) == Some(RunState::Running) {
-                        self.selected_run = p.runs.last().map(|r| r.id.clone());
+                    // Follow the question that is running (a new one or a continued debate).
+                    if let Some(r) = p.runs.iter().rev().find(|r| r.state == RunState::Running) {
+                        self.selected_run = Some(r.id.clone());
                     }
                     if let Some(s) = &mut self.snapshot {
                         s.project = *p;
@@ -339,6 +381,14 @@ impl Workspace {
                 }
                 Event::Finished => {
                     self.pending = self.pending.saturating_sub(1);
+                    if self.pending == 0 && std::mem::take(&mut self.open_report_when_done) {
+                        let done = self
+                            .current_run()
+                            .is_some_and(|r| r.state != RunState::Running && !r.report.is_empty());
+                        if done && self.page == Page::Inquiry {
+                            self.run_tab = RunTab::Report;
+                        }
+                    }
                     if self.pending == 0 && !self.background {
                         self.status = self
                             .current_run()
@@ -388,6 +438,7 @@ impl Workspace {
         }
         self.page = Page::Inquiry;
         self.run_tab = RunTab::Debate;
+        self.open_report_when_done = true;
         self.service.cancel.store(false, Ordering::SeqCst);
         self.save_settings(cx);
         let _ = self.service.send(Command::Draft(question.clone()));
@@ -399,6 +450,127 @@ impl Workspace {
             },
             cx,
         );
+    }
+    fn ask_followup(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.busy() {
+            return;
+        }
+        let Some(run_id) = self.selected_run.clone() else {
+            return;
+        };
+        let question = self.followup.read(cx).value().trim().to_string();
+        if question.is_empty() {
+            return;
+        }
+        self.followup
+            .update(cx, |f, cx| f.set_value("", window, cx));
+        self.submit(Command::Ask { run_id, question }, cx);
+    }
+    fn continue_run(&mut self, run_id: String, window: &mut Window, cx: &mut Context<Self>) {
+        if self.busy() {
+            return;
+        }
+        let direction = self.direction.read(cx).value().trim().to_string();
+        self.direction
+            .update(cx, |d, cx| d.set_value("", window, cx));
+        self.run_tab = RunTab::Debate;
+        self.open_report_when_done = true;
+        self.save_settings(cx);
+        self.submit(
+            Command::Continue {
+                run_id,
+                rounds: self.continue_rounds,
+                direction,
+            },
+            cx,
+        );
+    }
+    /// Export: the reader report for this question or the whole project, or a backup.
+    fn export_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.busy() {
+            return;
+        }
+        let view = cx.entity().downgrade();
+        let current = self
+            .current_run()
+            .filter(|r| r.state != RunState::Running && !r.report.is_empty())
+            .map(|r| (r.id.clone(), short(&r.question, 48)));
+        let has_runs = self.snapshot.as_ref().is_some_and(|s| {
+            s.project
+                .runs
+                .iter()
+                .any(|r| r.state != RunState::Running && !r.report.is_empty())
+        });
+        window.open_dialog(cx, move |dialog, _, cx| {
+            let option = |id: &'static str, icon: Lucide, title: String, detail: &str, enabled: bool, kind: String, cx: &App| {
+                let view = view.clone();
+                observed(
+                    h_flex()
+                        .id(id)
+                        .w_full()
+                        .gap_3()
+                        .items_start()
+                        .p_3()
+                        .rounded(cx.theme().radius_lg)
+                        .border_1()
+                        .border_color(cx.theme().border)
+                        .when(enabled, |v| v.cursor_pointer().hover(|s| s.bg(cx.theme().muted)))
+                        .when(!enabled, |v| v.opacity(0.5))
+                        .child(Icon::new(icon))
+                        .child(
+                            v_flex()
+                                .flex_1()
+                                .min_w_0()
+                                .gap_0p5()
+                                .child(div().text_sm().font_weight(FontWeight::SEMIBOLD).child(title))
+                                .child(div().text_xs().text_color(cx.theme().muted_foreground).child(detail.to_string())),
+                        )
+                        .when(enabled, |v| {
+                            v.on_click(move |_, window, cx| {
+                                let _ = view.update(cx, |this, cx| this.choose_path(&kind, cx));
+                                window.close_dialog(cx);
+                            })
+                        }),
+                )
+            };
+            dialog
+                .title("내보내기")
+                .w(px(560.))
+                .child(
+                    v_flex()
+                        .gap_2()
+                        .child(option(
+                            "export-run-report",
+                            Lucide::FileText,
+                            match &current {
+                                Some((_, q)) => format!("이 질문의 보고서 · {q}"),
+                                None => "이 질문의 보고서".into(),
+                            },
+                            "report.md(인용 [@키]) · references.bib · report.html(그림·용어 풀이가 있는 인터랙티브 페이지) · 그림 SVG · 토론 기록 부록. 넣어 둔 자료 원문은 담지 않습니다.",
+                            current.is_some(),
+                            current.as_ref().map(|(id, _)| format!("report:{id}")).unwrap_or_default(),
+                            cx,
+                        ))
+                        .child(option(
+                            "export-project-report",
+                            Lucide::BookOpen,
+                            "프로젝트 전체 보고서".into(),
+                            "모든 질문의 보고서를 한 문서로, 참고문헌은 하나의 references.bib로 묶습니다.",
+                            has_runs,
+                            "project-report".into(),
+                            cx,
+                        ))
+                        .child(option(
+                            "export-backup",
+                            Lucide::Archive,
+                            "백업 bundle".into(),
+                            "다른 컴퓨터에서 ‘bundle 가져오기’로 다시 열기 위한 전체 기록입니다. 첨부한 자료 원문을 포함하니 공유용으로 쓰지 마세요.",
+                            true,
+                            "backup".into(),
+                            cx,
+                        )),
+                )
+        });
     }
     fn clear_question(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.busy() {
@@ -538,7 +710,7 @@ impl Workspace {
                     "source" => "자료 추가 (PDF · EPUB · DOCX · 텍스트)",
                     "project" => "연구 프로젝트 폴더 선택",
                     "bundle" => "Theory bundle 폴더 열기",
-                    _ => "내보낼 폴더 선택",
+                    _ => "내보낼 위치 선택",
                 }
                 .into(),
             ),
@@ -555,6 +727,14 @@ impl Workspace {
                                 "source" => Command::Import(path),
                                 "project" => Command::OpenFolder(path),
                                 "bundle" => Command::ImportBundle(path),
+                                "project-report" => Command::ExportReport {
+                                    path,
+                                    scope: ReportScope::Project,
+                                },
+                                k if k.starts_with("report:") => Command::ExportReport {
+                                    path,
+                                    scope: ReportScope::Run(k["report:".len()..].to_string()),
+                                },
                                 _ => Command::Export(path),
                             },
                             cx,
@@ -728,7 +908,7 @@ impl Workspace {
                     ))
                     .child(observed(
                         row_button("nav-export", Lucide::Share, "내보내기…", false, cx)
-                            .on_click(cx.listener(|this, _, _, cx| this.choose_path("export", cx))),
+                            .on_click(cx.listener(|this, _, w, cx| this.export_dialog(w, cx))),
                     )),
             )
     }
@@ -980,7 +1160,7 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &NewQuestion, w, cx| this.clear_question(w, cx)))
             .on_action(cx.listener(|this, _: &NewProject, w, cx| this.project_dialog(w, cx)))
             .on_action(cx.listener(|this, _: &ImportSource, _, cx| this.choose_path("source", cx)))
-            .on_action(cx.listener(|this, _: &ExportProject, _, cx| this.choose_path("export", cx)))
+            .on_action(cx.listener(|this, _: &ExportProject, w, cx| this.export_dialog(w, cx)))
             .on_action(cx.listener(|this, _: &OpenSettings, _, cx| {
                 this.open_settings(cx);
             }))

@@ -336,7 +336,17 @@ impl Store {
         atomic_write(&preview, &read_bounded(&asset, MAX_ASSET)?)?;
         Ok(preview)
     }
-    pub fn export(&self, destination: &Path) -> Result<PathBuf> {
+    /// Backup bundle for re-import: project data, database and attached source files,
+    /// plus the reader report in `report/`. Unlike a report export it contains the sources.
+    pub fn export(&mut self, destination: &Path) -> Result<PathBuf> {
+        let finished: Vec<String> = self
+            .project
+            .runs
+            .iter()
+            .filter(|r| r.state != RunState::Running && !r.report.is_empty())
+            .map(|r| r.id.clone())
+            .collect();
+        self.freeze_citation_keys(&finished)?;
         fs::create_dir_all(destination)?;
         let bundle = destination.join(format!(
             "theory-{}-{}.theorybundle",
@@ -351,10 +361,21 @@ impl Store {
                 &staging.join("project.json"),
                 &serde_json::to_vec_pretty(&self.project)?,
             )?;
-            atomic_write(
-                &staging.join("report.md"),
-                markdown(&self.project).as_bytes(),
-            )?;
+            let runs: Vec<&Run> = self
+                .project
+                .runs
+                .iter()
+                .filter(|r| r.state != RunState::Running && !r.report.is_empty())
+                .collect();
+            if !runs.is_empty() {
+                fs::create_dir_all(staging.join("report/figures"))?;
+                write_report_files(
+                    &self.project,
+                    &runs,
+                    &self.project.title,
+                    &staging.join("report"),
+                )?;
+            }
             self.db
                 .backup(rusqlite::MAIN_DB, staging.join("project.sqlite"), None)?;
             for s in &self.project.sources {
@@ -421,131 +442,180 @@ fn safe_id(id: &str) -> bool {
 fn safe_hash(h: &str) -> bool {
     h.len() == 64 && h.bytes().all(|b| b.is_ascii_hexdigit())
 }
-pub fn markdown(p: &Project) -> String {
-    let mut out = format!(
-        "# {}\n\n작업 판본: {} · 프로젝트: {}\n\n",
-        p.title, p.revision, p.id
-    );
-    for r in &p.runs {
-        out.push_str(&format!(
-            "## {}\n\n상태: {} · 기준 판본 {} · 호출 {}/{}\n\n{}\n\n",
-            r.question,
-            r.state.label(),
-            r.base_revision,
-            r.calls,
-            r.budget.calls(),
-            r.report
-        ));
-        for l in &r.limitations {
-            out.push_str(&format!("- 한계: {l}\n"));
+/// What a report export covers.
+#[derive(Clone, Debug)]
+pub enum ReportScope {
+    Run(String),
+    Project,
+}
+fn file_slug(title: &str) -> String {
+    let cleaned: String = title
+        .chars()
+        .map(|c| {
+            if c.is_control() || "/\\:*?\"<>|".contains(c) {
+                '-'
+            } else {
+                c
+            }
+        })
+        .collect();
+    let words = cleaned.split_whitespace().collect::<Vec<_>>().join(" ");
+    let short: String = words.chars().take(40).collect();
+    let short = short.trim_matches(['.', ' ', '-']).to_string();
+    if short.is_empty() {
+        "theory-report".into()
+    } else {
+        short
+    }
+}
+/// Write the reader report files for `runs` into `dir`: report.md (pandoc citations),
+/// references.bib, report.html, figures/*.svg and debate-record.md. Source documents
+/// are never copied.
+fn write_report_files(p: &Project, runs: &[&Run], title: &str, dir: &Path) -> Result<()> {
+    use crate::report::{Palette, ReaderView, document, figure_svg, html_page, reader_view};
+    let views: Vec<(&Run, ReaderView)> = runs.iter().map(|r| (*r, reader_view(p, r))).collect();
+    let figure_name = |i: usize, f: &Figure| {
+        format!(
+            "figures/q{}-{}.svg",
+            i + 1,
+            f.id.chars()
+                .filter(|c| c.is_ascii_alphanumeric())
+                .collect::<String>()
+        )
+    };
+    for (i, (_, view)) in views.iter().enumerate() {
+        for f in &view.report.figures {
+            if let Some((svg, _, _)) = figure_svg(f, &Palette::LIGHT) {
+                atomic_write(&dir.join(figure_name(i, f)), svg.as_bytes())?;
+            }
         }
-        let who = |label: &str| crate::providers::ProviderKind::from_label(label).display();
-        let d = &r.deliberation;
-        if !d.author.is_empty() {
-            out.push_str(&format!(
-                "\n### 토론 기록\n\n구성 {} · 비판 {} · 수정 {}회{}\n\n",
-                who(&d.author),
-                who(&d.critic),
-                d.rounds,
-                d.stop
-                    .map(|s| format!(" · {}", s.label()))
-                    .unwrap_or_default()
-            ));
-            for a in r
-                .attempts
-                .iter()
-                .filter(|a| a.state == TaskState::Succeeded)
-            {
-                if let (Some(phase), Some(o)) = (a.phase, &a.output)
-                    && phase != Phase::Plan
+    }
+    atomic_write(
+        &dir.join("report.md"),
+        document(title, &views, &figure_name).as_bytes(),
+    )?;
+    let mut references = crate::report::References::default();
+    for (_, view) in &views {
+        for (k, b) in &view.references.entries {
+            if references.get(k).is_none() {
+                references.entries.push((k.clone(), b.clone()));
+            }
+        }
+    }
+    atomic_write(&dir.join("references.bib"), references.bibtex().as_bytes())?;
+    atomic_write(
+        &dir.join("report.html"),
+        html_page(title, &views).as_bytes(),
+    )?;
+    let keys: std::collections::HashMap<String, String> = p
+        .sources
+        .iter()
+        .filter_map(|s| {
+            let key = s.bib.as_ref()?.key.clone();
+            (!key.is_empty()).then(|| (s.id.clone(), key))
+        })
+        .collect();
+    atomic_write(
+        &dir.join("debate-record.md"),
+        crate::report::debate_record(p, runs, &keys).as_bytes(),
+    )?;
+    Ok(())
+}
+impl Store {
+    /// Give the cited sources of these runs permanent citation keys, so that report text,
+    /// BibTeX and later exports keep agreeing.
+    pub fn freeze_citation_keys(&mut self, run_ids: &[String]) -> Result<()> {
+        let mut changed = false;
+        for id in run_ids {
+            let Some(run) = self.project.runs.iter().find(|r| r.id == *id) else {
+                continue;
+            };
+            for (source_id, key) in crate::report::run_keys(&self.project, run) {
+                if let Some(s) = self.project.sources.iter_mut().find(|s| s.id == source_id)
+                    && s.bib.as_ref().is_none_or(|b| b.key.is_empty())
                 {
-                    let step = if a.round > 0 {
-                        format!("{}차 {}", a.round, phase.label())
-                    } else {
-                        phase.label().to_string()
-                    };
-                    out.push_str(&format!(
-                        "- **{} · {step}**: {}\n",
-                        who(&a.provider),
-                        o.summary.lines().next().unwrap_or_default()
-                    ));
+                    let mut b = s.derived_bib();
+                    b.key = key;
+                    s.bib = Some(b);
+                    changed = true;
                 }
             }
         }
-        if !r.critiques.is_empty() {
-            out.push_str("\n### 비판 원장\n\n");
-            for c in &r.critiques {
-                out.push_str(&format!(
-                    "- **{}** [{} · {}] {} (대상 `{}`, {} 제기)\n",
-                    c.id,
-                    c.critique.severity,
-                    c.status.label(),
-                    c.critique.reasoning,
-                    if c.critique.target_id.is_empty() {
-                        "초안 전체"
-                    } else {
-                        &c.critique.target_id
-                    },
-                    who(&c.provider)
-                ));
-                for e in &c.events {
-                    out.push_str(&format!(
-                        "  - {}차 {} {}: {}\n",
-                        e.round,
-                        who(&e.provider),
-                        e.stance
-                            .map(|s| s.label())
-                            .or(e.status.map(|s| s.label()))
-                            .unwrap_or_default(),
-                        e.reasoning
-                    ));
-                }
-            }
+        if changed {
+            self.save("인용 키 고정")?;
         }
-        for a in &r.attempts {
-            if let Some(o) = &a.output {
-                for e in &o.evidence_refs {
-                    out.push_str(&format!(
-                        "\n> {}\n\n출처 [{}](#{}), 행 {}–{}, hash `{}`, 판정 {:?}: {}\n",
-                        e.quote,
-                        e.source_id,
-                        e.source_id,
-                        e.start_line,
-                        e.end_line,
-                        e.source_hash,
-                        e.relation,
-                        e.reasoning
-                    ));
-                }
-                // Runs before the critique ledger existed kept critiques only in outputs.
-                if r.critiques.is_empty() {
-                    for c in &o.critiques {
-                        out.push_str(&format!(
-                            "\n- 미해결 비판 / {} / {}: {}\n",
-                            c.target_id, c.severity, c.reasoning
-                        ));
-                    }
-                }
+        Ok(())
+    }
+    /// Write the interactive HTML report for one question into the project's preview
+    /// folder and return its path (for opening in a browser).
+    pub fn preview_report(&mut self, run_id: &str) -> Result<PathBuf> {
+        self.freeze_citation_keys(&[run_id.to_string()])?;
+        let run = self
+            .project
+            .runs
+            .iter()
+            .find(|r| r.id == run_id)
+            .context("질문을 찾지 못했습니다")?;
+        ensure!(safe_id(&run.id), "잘못된 질문 ID");
+        let dir = self.directory.join("preview").join(&run.id);
+        fs::create_dir_all(dir.join("figures"))?;
+        let title = crate::report::reader_view(&self.project, run).report.title;
+        write_report_files(&self.project, &[run], &title, &dir)?;
+        Ok(dir.join("report.html"))
+    }
+    /// Export reader reports as a folder. Returns the folder.
+    pub fn export_report(&mut self, destination: &Path, scope: ReportScope) -> Result<PathBuf> {
+        let ids: Vec<String> = match &scope {
+            ReportScope::Run(id) => {
+                let run = self
+                    .project
+                    .runs
+                    .iter()
+                    .find(|r| r.id == *id)
+                    .context("질문을 찾지 못했습니다")?;
+                ensure!(
+                    run.state != RunState::Running,
+                    "실행이 끝난 뒤 내보낼 수 있습니다"
+                );
+                vec![id.clone()]
             }
+            ReportScope::Project => self
+                .project
+                .runs
+                .iter()
+                .filter(|r| r.state != RunState::Running && !r.report.is_empty())
+                .map(|r| r.id.clone())
+                .collect(),
+        };
+        ensure!(!ids.is_empty(), "내보낼 답변이 없습니다");
+        self.freeze_citation_keys(&ids)?;
+        let p = &self.project;
+        let runs: Vec<&Run> = ids
+            .iter()
+            .filter_map(|id| p.runs.iter().find(|r| r.id == *id))
+            .collect();
+        let title = match &scope {
+            ReportScope::Run(_) => crate::report::reader_view(p, runs[0]).report.title,
+            ReportScope::Project => p.title.clone(),
+        };
+        fs::create_dir_all(destination)?;
+        let base = format!("{}_보고서_{}", file_slug(&title), crate::report::today());
+        let mut folder = destination.join(&base);
+        let mut n = 2;
+        while folder.exists() {
+            folder = destination.join(format!("{base}-{n}"));
+            n += 1;
         }
+        let staging = destination.join(id(".report"));
+        let result = (|| {
+            fs::create_dir_all(staging.join("figures"))?;
+            write_report_files(p, &runs, &title, &staging)?;
+            fs::rename(&staging, &folder)?;
+            Ok(folder.clone())
+        })();
+        if result.is_err() {
+            let _ = fs::remove_dir_all(&staging);
+        }
+        result
     }
-    out.push_str("\n## 주장·가정 원장\n\n");
-    for e in &p.entries {
-        out.push_str(&format!(
-            "- **{}** ({:?}, {:?}, {:?}): {}\n  - 범위: {}\n  - 근거/도입 이유: {}\n  - 의존: {}\n",
-            e.proposal.id,
-            e.proposal.kind,
-            e.adoption,
-            e.review,
-            e.proposal.statement,
-            e.proposal.scope,
-            e.proposal.rationale,
-            e.proposal.depends_on.join(", ")
-        ));
-    }
-    out.push_str("\n## 출처\n\n");
-    for s in &p.sources {
-        out.push_str(&format!("<a id=\"{}\"></a>\n### {}\n\nID: {} · {:?} · 판본 {} · 위치: {}\n\n텍스트 hash: `{}`\n\n```text\n{}\n```\n\n",s.id,s.title,s.id,s.access,s.revision,s.locator,s.hash,s.numbered()));
-    }
-    out
 }

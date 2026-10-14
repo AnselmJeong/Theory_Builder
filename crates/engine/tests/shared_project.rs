@@ -186,13 +186,12 @@ fn export_uses_stable_extensions_and_reads_legacy_extensionless_bundles() {
     let file = root.path().join("paper.txt");
     fs::write(&file, "Stable text").unwrap();
     store.import_file(&file).unwrap();
-    let source = &store.project.sources[0];
-    let digest = source.asset_hash.as_ref().unwrap();
+    let digest = store.project.sources[0].asset_hash.clone().unwrap();
     let bundle = store.export(&root.path().join("export")).unwrap();
     let typed = bundle.join("assets").join(format!("{digest}.txt"));
     assert!(typed.is_file());
     Store::import_bundle(&root.path().join("typed-copy"), &bundle).unwrap();
-    fs::rename(&typed, bundle.join("assets").join(digest)).unwrap();
+    fs::rename(&typed, bundle.join("assets").join(&digest)).unwrap();
     let manifest = bundle.join("manifest.json");
     let mut value: serde_json::Value =
         serde_json::from_slice(&fs::read(&manifest).unwrap()).unwrap();

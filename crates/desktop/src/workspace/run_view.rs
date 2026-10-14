@@ -1,5 +1,5 @@
-//! One question: what was concluded, how the two models argued their way there,
-//! which text supports it, and the raw request record.
+//! One question: the reader report, the working theory behind it, how the two models
+//! argued their way there, which text supports it, and the raw request record.
 use super::*;
 use gpui_kit::component::tab::{Tab, TabBar};
 use std::collections::HashMap;
@@ -7,7 +7,8 @@ use std::collections::HashMap;
 impl Workspace {
     pub(super) fn run_view(&self, run: &Run, cx: &mut Context<Self>) -> AnyElement {
         let body = match self.run_tab {
-            RunTab::Answer => self.answer_tab(run, cx),
+            RunTab::Report => self.report_tab(run, cx),
+            RunTab::Theory => self.theory_tab(run, cx),
             RunTab::Debate => self.debate_tab(run, cx),
             RunTab::Evidence => self.evidence_tab(run, cx),
             RunTab::Log => self.log_tab(run, cx),
@@ -67,7 +68,10 @@ impl Workspace {
                     run.budget.name()
                 )),
         );
-        let report = run.report.clone();
+        let copy_id = run.id.clone();
+        let finished = run.state != RunState::Running && !run.report.is_empty();
+        let open_id = run.id.clone();
+        let export_id = run.id.clone();
         let question = run.question.clone();
         let targets = run.targets.clone();
         let critiques = run.critiques.len();
@@ -86,21 +90,24 @@ impl Workspace {
         let tabs = TabBar::new("run-tabs")
             .underline()
             .selected_index(match self.run_tab {
-                RunTab::Answer => 0,
-                RunTab::Debate => 1,
-                RunTab::Evidence => 2,
-                RunTab::Log => 3,
+                RunTab::Report => 0,
+                RunTab::Theory => 1,
+                RunTab::Debate => 2,
+                RunTab::Evidence => 3,
+                RunTab::Log => 4,
             })
             .on_click(cx.listener(|this, ix: &usize, _, cx| {
                 this.run_tab = match ix {
-                    0 => RunTab::Answer,
-                    1 => RunTab::Debate,
-                    2 => RunTab::Evidence,
+                    0 => RunTab::Report,
+                    1 => RunTab::Theory,
+                    2 => RunTab::Debate,
+                    3 => RunTab::Evidence,
                     _ => RunTab::Log,
                 };
                 cx.notify();
             }))
-            .child(Tab::new().label("답변"))
+            .child(Tab::new().label("보고서"))
+            .child(Tab::new().label("이론 상세"))
             .child(Tab::new().label(if critiques > 0 {
                 format!("토론 · 비판 {critiques}")
             } else {
@@ -132,13 +139,51 @@ impl Workspace {
                                     .ghost()
                                     .small()
                                     .icon(Icon::new(Lucide::Copy))
-                                    .tooltip("답변 복사")
-                                    .disabled(report.is_empty())
-                                    .on_click(move |_, _, cx| {
-                                        cx.write_to_clipboard(ClipboardItem::new_string(
-                                            report.clone(),
-                                        ))
-                                    }),
+                                    .tooltip("보고서를 Markdown으로 복사")
+                                    .disabled(!finished)
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        // Built on click: the whole report as readable Markdown.
+                                        let Some(s) = &this.snapshot else { return };
+                                        let Some(run) =
+                                            s.project.runs.iter().find(|r| r.id == copy_id)
+                                        else {
+                                            return;
+                                        };
+                                        let view =
+                                            theory_engine::report::reader_view(&s.project, run);
+                                        let md = theory_engine::report::run_markdown(
+                                            run,
+                                            &view,
+                                            1,
+                                            &|f| format!("{}.svg", f.id),
+                                        );
+                                        let text = view
+                                            .references
+                                            .display(&md, theory_engine::report::CiteStyle::Text);
+                                        cx.write_to_clipboard(ClipboardItem::new_string(text));
+                                    })),
+                            )
+                            .child(
+                                Button::new("open-report-browser")
+                                    .ghost()
+                                    .small()
+                                    .icon(Icon::new(Lucide::ExternalLink))
+                                    .tooltip("브라우저에서 인터랙티브 보고서 열기")
+                                    .disabled(!finished || self.busy())
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.submit(Command::OpenReport(open_id.clone()), cx)
+                                    })),
+                            )
+                            .child(
+                                Button::new("export-report")
+                                    .ghost()
+                                    .small()
+                                    .icon(Icon::new(Lucide::FileDown))
+                                    .tooltip("이 질문의 보고서 내보내기 (report.md · references.bib · report.html)")
+                                    .disabled(!finished || self.busy())
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.choose_path(&format!("report:{export_id}"), cx)
+                                    })),
                             )
                             .child(
                                 Button::new("retry-question")
@@ -221,8 +266,19 @@ impl Workspace {
         }
         counts
     }
-    fn answer_tab(&self, run: &Run, cx: &mut Context<Self>) -> AnyElement {
-        let mut body = v_flex().gap_5();
+    /// The material behind the report: the synthesis as the author model wrote it, the
+    /// numbered working theory, and objections that are still open.
+    fn theory_tab(&self, run: &Run, cx: &mut Context<Self>) -> AnyElement {
+        let names = self
+            .snapshot
+            .as_ref()
+            .map(|s| theory_engine::execution::reader::internal_names(&s.project, run))
+            .unwrap_or_default();
+        let friendly = |t: &str| theory_engine::execution::reader::friendly(t, &names);
+        let mut body = v_flex().gap_5().child(muted(
+            "보고서의 재료입니다. 두 모델이 토론하며 만들고 고친 가설 조각(작업 이론)과, 구성 모델이 쓴 토론 종합 원문을 보여 줍니다. 아직 아무것도 채택되지 않았으며, 주장·가정 페이지에서 항목을 채택하거나 철회할 수 있습니다.",
+            cx,
+        ));
         if run.report.is_empty() {
             body = body.child(
                 card(cx)
@@ -249,10 +305,12 @@ impl Workspace {
                     ),
             );
         } else {
-            body = body.child(document(
-                SharedString::from(format!("report-{}", run.id)),
-                run.report.clone(),
-            ));
+            body = body
+                .child(section_title("토론 종합 (구성 모델의 원문)", cx))
+                .child(card(cx).child(div().text_sm().child(document(
+                    SharedString::from(format!("report-{}", run.id)),
+                    friendly(&run.report),
+                ))));
         }
         let theory = run.theory();
         if !theory.is_empty() {
@@ -293,7 +351,7 @@ impl Workspace {
                                 .flex_1()
                                 .min_w_0()
                                 .gap_1()
-                                .child(div().text_sm().child(p.statement.clone()))
+                                .child(div().text_sm().child(friendly(&p.statement)))
                                 .child(
                                     h_flex()
                                         .gap_1()
@@ -320,7 +378,10 @@ impl Workspace {
             }
             body = body
                 .child(section_title(
-                    format!("작업 이론 · 항목 {}개 (채택 전 제안)", theory.len()),
+                    format!(
+                        "작업 이론 · 항목 {}개 (채택 전 제안 · 번호는 ‘작업 이론 n’)",
+                        theory.len()
+                    ),
                     cx,
                 ))
                 .child(list);
@@ -402,7 +463,7 @@ impl Workspace {
                         div()
                             .text_xs()
                             .font_weight(FontWeight::SEMIBOLD)
-                            .child(c.id.clone()),
+                            .child(c.label()),
                     )
                     .child(chip(
                         severity_label(&c.critique.severity),
@@ -456,7 +517,7 @@ impl Workspace {
         let steps: Vec<&Attempt> = run
             .attempts
             .iter()
-            .filter(|a| phase_of(a) != Phase::Plan)
+            .filter(|a| !matches!(phase_of(a), Phase::Plan | Phase::Ask))
             .filter(|a| {
                 // Show a failed attempt only when it was not retried successfully.
                 a.state == TaskState::Succeeded
@@ -486,12 +547,54 @@ impl Workspace {
                 .into_any_element();
         }
         let mut last_group: Option<String> = None;
+        let mut shown_directions = 0;
         for a in steps {
             let group = match (phase_of(a), a.round) {
-                (Phase::Synthesis, _) => "최종 종합".to_string(),
+                (Phase::Synthesis | Phase::Report, r)
+                    if r > 0 && run.deliberation.continuations > 0 =>
+                {
+                    format!("최종 종합 · {r}차까지")
+                }
+                (Phase::Synthesis | Phase::Report, _) => "최종 종합".to_string(),
                 (_, 0) => "초기 구성과 첫 비판".to_string(),
                 (_, r) => format!("{r}차 토론 — 응답·수정과 재검토"),
             };
+            // The user's direction opens the round it was given for.
+            for d in run.directions.iter().skip(shown_directions) {
+                if a.round < d.round || phase_of(a) == Phase::Report {
+                    break;
+                }
+                shown_directions += 1;
+                body = body.child(
+                    h_flex()
+                        .gap_2()
+                        .items_start()
+                        .p_3()
+                        .mt_2()
+                        .rounded(cx.theme().radius_lg)
+                        .border_1()
+                        .border_color(report_view::accent(cx).opacity(0.4))
+                        .child(
+                            Icon::new(Lucide::User)
+                                .small()
+                                .text_color(report_view::accent(cx)),
+                        )
+                        .child(
+                            v_flex()
+                                .flex_1()
+                                .min_w_0()
+                                .gap_0p5()
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .text_color(report_view::accent(cx))
+                                        .child(format!("사용자 방향 · {}차부터", d.round)),
+                                )
+                                .child(div().text_sm().child(d.text.clone())),
+                        ),
+                );
+            }
             if last_group.as_ref() != Some(&group) {
                 body = body.child(
                     h_flex()
@@ -530,7 +633,7 @@ impl Workspace {
                         StopReason::Stalled => Lucide::Scale,
                         _ => Lucide::CircleAlert,
                     }))
-                    .child(div().text_sm().child(format!(
+                    .child(div().flex_1().text_sm().child(format!(
                         "토론 종료 · {} · 수정 {}회 · 비판 {}개 중 {}개 정리",
                         stop.label(),
                         run.deliberation.rounds,
@@ -538,6 +641,9 @@ impl Workspace {
                         settled
                     ))),
             );
+        }
+        if run.state != RunState::Running && run.deliberation.stop.is_some() {
+            body = body.child(self.continue_card(run, cx));
         }
         body.into_any_element()
     }
@@ -615,6 +721,27 @@ impl Workspace {
                     .child(format!("과제: {objective}")),
             );
         }
+        if phase == Phase::Report && a.state == TaskState::Succeeded {
+            bubble = bubble
+                .child(muted(
+                    "서기가 토론에 참여하지 않은 별도 문맥에서 결론·작업 이론·비판을 읽고, 그림과 용어 풀이를 갖춘 읽기 쉬운 보고서로 정리했습니다.",
+                    cx,
+                ))
+                .child(
+                    h_flex().child(
+                        Button::new(SharedString::from(format!("debate-open-report-{}", a.id)))
+                            .ghost()
+                            .xsmall()
+                            .icon(Icon::new(Lucide::ArrowRight))
+                            .label("보고서 보기")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.run_tab = RunTab::Report;
+                                cx.notify();
+                            })),
+                    ),
+                );
+            return h_flex().w_full().child(bubble.w_full());
+        }
         if let Some(o) = &a.output {
             if phase == Phase::Synthesis {
                 let first = o
@@ -634,9 +761,9 @@ impl Workspace {
                                 .ghost()
                                 .xsmall()
                                 .icon(Icon::new(Lucide::ArrowRight))
-                                .label("전체 답변 보기")
+                                .label("이론 상세 보기")
                                 .on_click(cx.listener(|this, _, _, cx| {
-                                    this.run_tab = RunTab::Answer;
+                                    this.run_tab = RunTab::Theory;
                                     cx.notify();
                                 })),
                         ),
@@ -657,10 +784,10 @@ impl Workspace {
                             .child(
                                 div()
                                     .flex_none()
-                                    .w(rems(1.75))
+                                    .w(rems(3.))
                                     .text_xs()
                                     .font_weight(FontWeight::SEMIBOLD)
-                                    .child(r.critique_id.clone()),
+                                    .child(critique_label(&r.critique_id)),
                             )
                             .child(chip(r.stance.label(), stance_color(r.stance, cx)))
                             .child(
@@ -686,10 +813,10 @@ impl Workspace {
                             .child(
                                 div()
                                     .flex_none()
-                                    .w(rems(1.75))
+                                    .w(rems(3.))
                                     .text_xs()
                                     .font_weight(FontWeight::SEMIBOLD)
-                                    .child(r.critique_id.clone()),
+                                    .child(critique_label(&r.critique_id)),
                             )
                             .child(chip(r.status.label(), status_color(r.status, cx)))
                             .child(
@@ -714,9 +841,9 @@ impl Workspace {
                 let mut list = v_flex().gap_1p5();
                 for (i, k) in o.critiques.iter().enumerate() {
                     let record = ids.get(i).copied();
-                    let label = record.map(|c| c.id.clone()).unwrap_or_default();
+                    let critique_id = record.map(|c| c.id.clone()).unwrap_or_default();
+                    let label = record.map(|c| c.label()).unwrap_or_default();
                     let run_id = run.id.clone();
-                    let critique_id = label.clone();
                     list = list.child(observed(
                         h_flex()
                             .id(SharedString::from(format!("new-critique-{}-{i}", a.id)))
@@ -739,7 +866,7 @@ impl Workspace {
                             .child(
                                 div()
                                     .flex_none()
-                                    .w(rems(1.75))
+                                    .w(rems(3.))
                                     .text_xs()
                                     .font_weight(FontWeight::SEMIBOLD)
                                     .child(label),

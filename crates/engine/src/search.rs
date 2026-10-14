@@ -8,7 +8,7 @@ use std::{
     sync::{atomic::Ordering, mpsc},
     time::{Duration, Instant},
 };
-use theory_core::{Access, Source, now};
+use theory_core::{Access, BibInfo, Source, now};
 const MAX_RESPONSE: u64 = 8_000_000;
 pub fn tinyfish_configured() -> bool {
     !tinyfish_key().is_empty()
@@ -146,9 +146,242 @@ pub fn parse_pubmed(xml: &str) -> Result<Vec<Source>> {
             find("Year")
         );
         source.retrieved_at = Some(now());
+        source.bib = Some(pubmed_bib(article, &pmid, &source.title));
         sources.push(source);
     }
     Ok(sources)
+}
+/// Bibliographic fields exactly as PubMed records them.
+fn pubmed_bib(article: roxmltree::Node<'_, '_>, pmid: &str, title: &str) -> BibInfo {
+    let first = |tag: &str| {
+        article
+            .descendants()
+            .find(|n| n.tag_name().name() == tag)
+            .map(text)
+            .unwrap_or_default()
+            .trim()
+            .to_string()
+    };
+    let authors = article
+        .descendants()
+        .filter(|n| n.tag_name().name() == "Author")
+        .filter_map(|a| {
+            let child = |tag: &str| {
+                a.children()
+                    .find(|n| n.tag_name().name() == tag)
+                    .map(text)
+                    .unwrap_or_default()
+            };
+            let (last, fore, initials, collective) = (
+                child("LastName"),
+                child("ForeName"),
+                child("Initials"),
+                child("CollectiveName"),
+            );
+            if !last.is_empty() {
+                let given = if fore.is_empty() { initials } else { fore };
+                Some(if given.is_empty() {
+                    last
+                } else {
+                    format!("{last}, {given}")
+                })
+            } else {
+                (!collective.is_empty()).then_some(collective)
+            }
+        })
+        .collect();
+    let pub_date = article
+        .descendants()
+        .find(|n| n.tag_name().name() == "PubDate");
+    let year = pub_date
+        .and_then(|d| {
+            d.children()
+                .find(|n| n.tag_name().name() == "Year")
+                .map(text)
+                .or_else(|| {
+                    d.children()
+                        .find(|n| n.tag_name().name() == "MedlineDate")
+                        .map(|n| text(n).chars().take(4).collect())
+                })
+        })
+        .unwrap_or_default();
+    let doi = article
+        .descendants()
+        .find(|n| {
+            (n.tag_name().name() == "ArticleId" && n.attribute("IdType") == Some("doi"))
+                || (n.tag_name().name() == "ELocationID" && n.attribute("EIdType") == Some("doi"))
+        })
+        .map(text)
+        .unwrap_or_default();
+    let mut b = BibInfo::default();
+    b.entry_type = "article".into();
+    b.title = title.trim().trim_end_matches('.').to_string();
+    b.authors = authors;
+    b.year = year.trim().into();
+    b.container = {
+        let iso = first("ISOAbbreviation");
+        let full = first("Title");
+        if full.is_empty() { iso } else { full }
+    };
+    b.volume = first("Volume");
+    b.number = first("Issue");
+    b.pages = first("MedlinePgn");
+    b.doi = doi.trim().into();
+    b.pmid = pmid.into();
+    b.url = format!("https://pubmed.ncbi.nlm.nih.gov/{pmid}/");
+    b.origin = "pubmed".into();
+    b
+}
+/// Fill in authors and journal details for cited sources from their PMID (PubMed) or a DOI
+/// printed in the source (Crossref). Read-only public metadata; failures leave the
+/// record as it was. Never changes a frozen citation key.
+pub fn enrich_bibliography(
+    sources: &mut [Source],
+    ids: &[String],
+    cancel: &Cancel,
+    deadline: Instant,
+) -> Vec<String> {
+    let mut warnings = vec![];
+    let Ok(client) = Client::builder()
+        .timeout(Duration::from_secs(20))
+        .redirect(reqwest::redirect::Policy::limited(3))
+        .user_agent("TheoryStudio/0.4 (bibliography; read-only)")
+        .build()
+    else {
+        return warnings;
+    };
+    let wanted: Vec<usize> = sources
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| ids.contains(&s.id))
+        .filter(|(_, s)| {
+            let b = s.derived_bib();
+            b.authors.is_empty() && (!b.pmid.is_empty() || !b.doi.is_empty())
+        })
+        .map(|(i, _)| i)
+        .collect();
+    let pmids: Vec<String> = wanted
+        .iter()
+        .map(|i| sources[*i].derived_bib().pmid)
+        .filter(|p| !p.is_empty() && p.bytes().all(|c| c.is_ascii_digit()))
+        .collect();
+    if !pmids.is_empty() {
+        let joined = pmids.join(",");
+        match request(
+            client
+                .get("https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi")
+                .query(&[
+                    ("db", "pubmed"),
+                    ("id", joined.as_str()),
+                    ("retmode", "xml"),
+                    ("rettype", "abstract"),
+                    ("tool", "TheoryStudio"),
+                ]),
+            cancel,
+            deadline,
+        )
+        .and_then(|xml| parse_pubmed(&xml))
+        {
+            Ok(found) => {
+                for f in found {
+                    let Some(fresh) = f.bib else { continue };
+                    for i in &wanted {
+                        let s = &mut sources[*i];
+                        if s.derived_bib().pmid == fresh.pmid {
+                            let key = s.bib.as_ref().map(|b| b.key.clone()).unwrap_or_default();
+                            let mut b = fresh.clone();
+                            b.key = key;
+                            s.bib = Some(b);
+                        }
+                    }
+                }
+            }
+            Err(e) => warnings.push(format!("PubMed 서지 정보: {e}")),
+        }
+    }
+    for i in wanted {
+        let current = sources[i].derived_bib();
+        if !current.authors.is_empty() || current.doi.is_empty() {
+            continue;
+        }
+        match crossref(&client, &current.doi, cancel, deadline) {
+            Ok(Some(mut b)) => {
+                b.key = current.key.clone();
+                sources[i].bib = Some(b);
+            }
+            Ok(None) => {}
+            Err(e) => warnings.push(format!("Crossref 서지 정보: {e}")),
+        }
+    }
+    warnings
+}
+fn crossref(
+    client: &Client,
+    doi: &str,
+    cancel: &Cancel,
+    deadline: Instant,
+) -> Result<Option<BibInfo>> {
+    ensure!(
+        doi.starts_with("10.") && doi.len() < 200 && !doi.contains(char::is_whitespace),
+        "DOI 형식 오류"
+    );
+    let raw = request(
+        client.get(format!("https://api.crossref.org/works/{doi}")),
+        cancel,
+        deadline,
+    )?;
+    let v: Value = serde_json::from_str(&raw)?;
+    Ok(parse_crossref(&v["message"]))
+}
+pub fn parse_crossref(m: &Value) -> Option<BibInfo> {
+    let title = m["title"][0].as_str()?.trim().to_string();
+    let s = |v: &Value| v.as_str().unwrap_or_default().trim().to_string();
+    let mut b = BibInfo::default();
+    b.entry_type = match m["type"].as_str() {
+        Some("journal-article") => "article",
+        Some("book") | Some("monograph") => "book",
+        Some("book-chapter") => "incollection",
+        Some("proceedings-article") => "inproceedings",
+        _ => "misc",
+    }
+    .into();
+    b.title = title;
+    b.authors = m["author"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|a| {
+            let family = s(&a["family"]);
+            let given = s(&a["given"]);
+            let name = s(&a["name"]);
+            if !family.is_empty() {
+                Some(if given.is_empty() {
+                    family
+                } else {
+                    format!("{family}, {given}")
+                })
+            } else {
+                (!name.is_empty()).then_some(name)
+            }
+        })
+        .collect();
+    b.year = ["published-print", "published-online", "issued", "created"]
+        .iter()
+        .find_map(|k| m[k]["date-parts"][0][0].as_u64())
+        .map(|y| y.to_string())
+        .unwrap_or_default();
+    b.container = s(&m["container-title"][0]);
+    b.volume = s(&m["volume"]);
+    b.number = s(&m["issue"]);
+    b.pages = s(&m["page"]);
+    b.publisher = if b.entry_type == "article" {
+        String::new()
+    } else {
+        s(&m["publisher"])
+    };
+    b.doi = s(&m["DOI"]);
+    b.origin = "crossref".into();
+    Some(b)
 }
 fn pubmed(client: &Client, query: &str, cancel: &Cancel, deadline: Instant) -> Result<Vec<Source>> {
     let raw = request(
@@ -280,7 +513,7 @@ pub fn retrieve(
     let client = Client::builder()
         .timeout(Duration::from_secs(35))
         .redirect(reqwest::redirect::Policy::none())
-        .user_agent("TheoryStudio/0.3 literature research")
+        .user_agent("TheoryStudio/0.4 literature research")
         .build()?;
     let key = tinyfish_key();
     let mut result = SearchResults {
@@ -325,6 +558,26 @@ mod tests {
         assert_eq!(s[0].access, Access::AbstractOnly);
         assert_eq!(s[0].text, "RESULTS: Limited finding.");
         assert_eq!(s[1].access, Access::MetadataOnly);
+        let full = parse_pubmed("<PubmedArticleSet><PubmedArticle><MedlineCitation><PMID>9</PMID><Article><Journal><JournalIssue><Volume>21</Volume><Issue>3</Issue><PubDate><Year>2019</Year></PubDate></JournalIssue><Title>Bipolar Disorders</Title><ISOAbbreviation>Bipolar Disord</ISOAbbreviation></Journal><ArticleTitle>Mood cycles.</ArticleTitle><Pagination><MedlinePgn>201-9</MedlinePgn></Pagination><AuthorList><Author><LastName>Bonsall</LastName><ForeName>Michael B</ForeName></Author><Author><CollectiveName>Mood Group</CollectiveName></Author></AuthorList></Article></MedlineCitation><PubmedData><ArticleIdList><ArticleId IdType=\"doi\">10.1111/bdi.1</ArticleId></ArticleIdList></PubmedData></PubmedArticle></PubmedArticleSet>").unwrap();
+        let b = full[0].bib.clone().unwrap();
+        assert_eq!(b.authors, ["Bonsall, Michael B", "Mood Group"]);
+        assert_eq!(
+            (
+                b.year.as_str(),
+                b.container.as_str(),
+                b.pages.as_str(),
+                b.doi.as_str()
+            ),
+            ("2019", "Bipolar Disorders", "201-9", "10.1111/bdi.1")
+        );
+        assert_eq!(b.title, "Mood cycles");
+    }
+    #[test]
+    fn crossref_records_become_bib_entries() {
+        let m = serde_json::json!({"title":["A model"],"type":"journal-article","author":[{"family":"Goldbeter","given":"Albert"}],"issued":{"date-parts":[[2011]]},"container-title":["Pharmacopsychiatry"],"volume":"44","page":"S44-S50","DOI":"10.1055/s-1"});
+        let b = parse_crossref(&m).unwrap();
+        assert_eq!(b.base_key(""), "goldbeter2011model");
+        assert_eq!(b.entry_type, "article");
     }
     #[test]
     fn web_targets_exclude_local_and_non_web() {

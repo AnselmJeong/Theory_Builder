@@ -245,6 +245,22 @@ pub fn task_context(p: &Project, run: &Run, task: &TaskSpec) -> Value {
     let (sources, omitted) = pack_sources(p, &task.source_ids, &run.question);
     json!({"question":run.question,"targets":run.targets,"base_revision":run.base_revision,"profiles":profiles(p),"task":task,"ledger":ledger_view(&ledger_entries(p,&run.targets,&run.question)),"sources":sources,"omitted_sources":omitted,"dependency_outputs":prior,"contract_version":"research/v2","output_id_prefix":prefix(run,&task.id),"rules":"Existing entries are read-only; revisions are new proposals with replaces_id. Critiques you raise receive engine IDs and are judged later by the critic; you never close critiques. Leave critique_responses and critique_reviews empty in this task. Include no model attribution or other reviewers' outputs when constructing independent candidates. If task dependencies are missing, state the gap. Numerical execution unavailable. Literature retrieval has already been performed if requested in the plan; only the supplied source text is evidence."})
 }
+/// Directions the user gave when continuing the debate. They come from the user, like the
+/// question, so they state task intent; they never count as evidence.
+const DIRECTION_RULE: &str = "user_direction lists directions the USER (not a model) added when asking for more debate rounds. Treat them as task intent like the question: address them explicitly in this step. They are not evidence; never invent sources or results to satisfy them.";
+fn with_directions(context: &mut Value, run: &Run) {
+    if run.directions.is_empty() {
+        return;
+    }
+    context["user_direction"] = json!(
+        run.directions
+            .iter()
+            .map(|d| json!({"given_before_round":d.round,"text":d.text}))
+            .collect::<Vec<_>>()
+    );
+    let rules = context["rules"].as_str().unwrap_or_default().to_string();
+    context["rules"] = json!(format!("{rules} {DIRECTION_RULE}"));
+}
 pub(super) fn prefix(run: &Run, task_id: &str) -> String {
     format!("{}_{}", &run.id[..run.id.len().min(12)], task_id)
 }
@@ -299,6 +315,7 @@ pub(super) fn deliberation_context(
             .map(|c| critique_view(c))
             .collect::<Vec<_>>()
     );
+    with_directions(&mut context, run);
     context
 }
 /// Final answer: the converged theory and the full critique ledger, including dissent.
@@ -308,7 +325,8 @@ pub(super) fn synthesis_context(p: &Project, run: &Run, task: &TaskSpec) -> Valu
     context["critique_ledger"] = json!(run.critiques.iter().map(critique_view).collect::<Vec<_>>());
     context["deliberation"] = json!({"rounds":run.deliberation.rounds,"max_rounds":run.deliberation.max_rounds,"stop":run.deliberation.stop,"steps":round_summaries(run)});
     context["rules"] = json!(
-        "Write the final answer for the user in their language. Start with the direct conclusion. Then present the theory as a short ordered argument that refers to final_theory IDs, separating reported findings with exact citations from assumptions, deductions and speculation. State faithfully which critiques were settled and which remain contested or open, giving both positions; agreement between models is not evidence. End with distinguishing predictions or observations and next checks in next_actions, and remaining gaps in unresolved. Refer to existing IDs instead of cloning proposals; add a new proposal only if the synthesis itself needs one. Leave critique_responses and critique_reviews empty. Set evidence_insufficient when the supplied sources cannot support the central claims."
+        "Write the final answer for the user in their language. Start with the direct conclusion. Then present the theory as a short ordered argument that refers to final_theory IDs, separating reported findings with exact citations from assumptions, deductions and speculation. State faithfully which critiques were settled and which remain contested or open, giving both positions; agreement between models is not evidence. End with distinguishing predictions or observations and next checks in next_actions, and remaining gaps in unresolved. Write each next action as a concrete step (what to measure or analyse, in what, and what result would count for or against), not 'verify X'. Refer to existing IDs instead of cloning proposals; add a new proposal only if the synthesis itself needs one. Leave critique_responses and critique_reviews empty. Set evidence_insufficient when the supplied sources cannot support the central claims. A separate scribe will rewrite this answer for the reader afterwards."
     );
+    with_directions(&mut context, run);
     context
 }

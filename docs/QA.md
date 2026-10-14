@@ -1,3 +1,23 @@
+# v0.4 검증 기록 — 2026-10-14
+
+서기 보고서, 인용·BibTeX·HTML 내보내기, 토론 이어 가기, 이어서 묻기를 추가한 판본의 검증이다. 내용과 이유는 [report-v0.4.md](report-v0.4.md)를 본다.
+
+## 자동 검증
+
+`cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings` 통과. `cargo test --workspace`: **73개 통과** (core 15, engine 단위 19, 토론 13, 공유 폴더 7, 실행·저장 14, GPUI 5). 세부 목록은 report-v0.4.md의 ‘검증’ 절에 있다. GPUI 테스트는 실제 구독 호출을 보내는 버튼을 누르지 않는다.
+
+## 실제 창과 내보낸 파일
+
+Xvfb + Mesa(Noto CJK 글꼴)에서 `demo_project` 데이터(스크립트 응답)로 보고서 탭 전체(답, 핵심 내용, 개념도, 표, 용어 풀이, 다음 단계, 참고문헌, 이어서 묻기 스레드, 토론 이어 가기), 이론 상세, 토론 탭 끝의 서기 단계와 이어 가기, 내보내기 대화상자를 xdotool로 클릭해 확인했다. 내보낸 `report.html`은 Chromium(Playwright)으로 1280px 라이트, 390px 다크에서 확인했고 개념도 상자를 눌러 설명이 열리는 것을 확인했다.
+
+## 미검증
+
+- 실제 Claude·Codex 구독으로 서기 보고서·이어 가기·후속 질문을 실행하지 않았다(이 환경에 로그인 없음). 보고서 품질은 실제 질문으로 확인해야 한다.
+- PubMed efetch·Crossref 서지 보완의 실제 네트워크 호출(파서만 검증).
+- macOS 빌드·번들.
+
+---
+
 # v0.3 검증 기록 — 2026-10-13
 
 이 절은 Linux 클라우드 환경에서 수행한 v0.3 검증이다. 아래 v0.2·v0.1 기록은 당시 기록으로 보존한다. 변경 내용과 진단은 [diagnosis-v0.3.md](diagnosis-v0.3.md)를 본다.

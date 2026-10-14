@@ -36,6 +36,9 @@ pub struct Source {
     pub retrieved_at: Option<u64>,
     #[serde(default)]
     pub search_query: Option<String>,
+    /// Bibliographic record for citations; derived on demand when absent.
+    #[serde(default)]
+    pub bib: Option<crate::BibInfo>,
 }
 fn source_active() -> bool {
     true
@@ -549,6 +552,10 @@ pub enum Phase {
     Review,
     Revise,
     Synthesis,
+    /// The scribe rewrites the outcome for the reader.
+    Report,
+    /// A follow-up question about a finished report.
+    Ask,
 }
 impl Phase {
     pub fn label(self) -> &'static str {
@@ -558,6 +565,8 @@ impl Phase {
             Self::Review => "비판",
             Self::Revise => "응답·수정",
             Self::Synthesis => "종합",
+            Self::Report => "보고서 작성",
+            Self::Ask => "후속 질문",
         }
     }
 }
@@ -593,6 +602,11 @@ pub struct Deliberation {
     pub max_rounds: u32,
     pub rounds: u32,
     pub stop: Option<StopReason>,
+    /// Round count when the user last continued the debate; dissent counted from here.
+    #[serde(default)]
+    pub resumed_at: u32,
+    #[serde(default)]
+    pub continuations: u32,
 }
 impl Deliberation {
     pub fn cross_model(&self) -> bool {
@@ -627,19 +641,37 @@ impl CritiqueRecord {
         matches!(self.critique.severity.as_str(), "medium" | "high")
     }
     pub fn times_contested(&self) -> usize {
+        self.times_contested_after(0)
+    }
+    pub fn times_contested_after(&self, round: u32) -> usize {
         self.events
             .iter()
-            .filter(|e| e.status == Some(CritiqueStatus::Contested))
+            .filter(|e| e.round > round && e.status == Some(CritiqueStatus::Contested))
             .count()
     }
     /// Still worth another revision round: open, or contested once (one more chance).
     pub fn actionable(&self) -> bool {
+        self.actionable_since(0)
+    }
+    /// After the user continues a debate, earlier dissent gets another chance.
+    pub fn actionable_since(&self, resumed_at: u32) -> bool {
         self.material()
             && match self.status {
                 CritiqueStatus::Open => true,
-                CritiqueStatus::Contested => self.times_contested() < 2,
+                CritiqueStatus::Contested => self.times_contested_after(resumed_at) < 2,
                 _ => false,
             }
+    }
+    /// "비판 3" — what readers see instead of the engine ID.
+    pub fn label(&self) -> String {
+        critique_label(&self.id)
+    }
+}
+/// "비판 3" for an engine critique ID ("K3").
+pub fn critique_label(id: &str) -> String {
+    match id.strip_prefix('K') {
+        Some(n) if !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()) => format!("비판 {n}"),
+        _ => id.to_string(),
     }
 }
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -699,8 +731,30 @@ pub struct Run {
     pub deliberation: Deliberation,
     #[serde(default)]
     pub critiques: Vec<CritiqueRecord>,
+    /// Calls granted after the original budget (continued debate, report, follow-ups).
+    #[serde(default)]
+    pub extra_calls: u32,
+    /// Directions the user added when continuing the debate.
+    #[serde(default)]
+    pub directions: Vec<crate::Direction>,
+    /// The reader-facing report written by the scribe.
+    #[serde(default)]
+    pub reading: Option<crate::Reading>,
+    #[serde(default)]
+    pub followups: Vec<crate::FollowUp>,
 }
 impl Run {
+    pub fn call_limit(&self) -> u32 {
+        self.budget.calls() + self.extra_calls
+    }
+    /// Reader numbering of the working theory ("작업 이론 3"), shared by every view.
+    pub fn theory_labels(&self) -> Vec<(String, String)> {
+        self.theory()
+            .into_iter()
+            .enumerate()
+            .map(|(i, p)| (p.id, format!("작업 이론 {}", i + 1)))
+            .collect()
+    }
     /// Latest version of every proposal made in this run: revisions supersede their drafts.
     pub fn theory(&self) -> Vec<Proposal> {
         let all: Vec<&Proposal> = self

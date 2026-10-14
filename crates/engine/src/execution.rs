@@ -20,8 +20,11 @@ use std::{
 use theory_core::*;
 mod citations;
 mod context;
+pub mod reader;
 use context::*;
 pub use context::{selected_entries, task_context};
+/// Calls kept for the end of every run: the final synthesis and the reader report.
+const TAIL: u32 = 2;
 
 pub const GENERAL: &str = include_str!("../../../resources/profiles/general-research.json");
 pub const NEURO: &str = include_str!("../../../resources/profiles/neurobiology.json");
@@ -45,7 +48,7 @@ pub(crate) fn ancestors(run: &Run, task: &TaskSpec) -> HashSet<String> {
     ids
 }
 fn planner_context(p: &Project, r: &Run, search_enabled: bool) -> Value {
-    let remaining = r.budget.calls().saturating_sub(r.calls + 1);
+    let remaining = r.call_limit().saturating_sub(r.calls + 2);
     let rounds = r.budget.rounds();
     let max_tasks = remaining.saturating_sub(2 * rounds).max(3);
     json!({"search_enabled":search_enabled,"search_instructions":"When search_enabled, generate up to 2 focused English literature search_queries (3-6 core terms each; avoid stacking every possible mechanism into one AND query) if external evidence is needed. Search is available through PubMed and TinyFish before task execution; retrieved sources are automatically attached to all tasks. For a research/theory question with no usable local sources, search is normally required. Use empty search_queries only when external evidence is unnecessary or the user forbids search. Never assume sources were checked before retrieval.","question":r.question,"target_ids":r.targets,"base_revision":r.base_revision,"profiles":profiles(p),"ledger":ledger_entries(p,&r.targets,&r.question).iter().map(|e| json!({"id":e.proposal.id,"kind":e.proposal.kind,"statement":e.proposal.statement,"adoption":e.adoption})).collect::<Vec<_>>(),"sources":p.sources.iter().filter(|s| s.active).map(|s|json!({"id":s.id,"title":s.title,"access":s.access,"lines":s.text.lines().count()})).collect::<Vec<_>>(),"max_tasks":max_tasks,
@@ -111,6 +114,8 @@ impl Step<'_> {
             (Phase::Review, r) => format!("{r}차 재검토"),
             (Phase::Revise, r) => format!("{r}차 응답·수정"),
             (Phase::Synthesis, _) => "답변 종합".into(),
+            (Phase::Report, _) => "읽기 쉬운 보고서 작성".into(),
+            (Phase::Ask, _) => "후속 질문 답변".into(),
         };
         format!("{} · {what}", self.provider.display())
     }
@@ -122,6 +127,10 @@ struct RunExecutor<'a> {
     cancel: &'a Cancel,
     notify: &'a mut dyn FnMut(&Project, String),
     deadline: Instant,
+    /// When this session of work began and how many calls the run had then; the time per
+    /// call is measured from here, not from the run's original start (continued debates).
+    began: Instant,
+    calls_before: u32,
     run_ix: usize,
     author: ProviderKind,
     critic: ProviderKind,
@@ -137,7 +146,7 @@ impl RunExecutor<'_> {
     }
     fn remaining(&self) -> u32 {
         let r = self.run();
-        r.budget.calls().saturating_sub(r.calls)
+        r.call_limit().saturating_sub(r.calls)
     }
     fn emit(&mut self, message: String) {
         (self.notify)(&self.store.project, message);
@@ -180,7 +189,7 @@ impl RunExecutor<'_> {
             }));
             let attempt_ix = run.attempts.len() - 1;
             self.store.save("호출 예산 예약 및 요청 기록")?;
-            let (calls, budget) = (self.run().calls, self.run().budget.calls());
+            let (calls, budget) = (self.run().calls, self.run().call_limit());
             self.emit(format!("{} · 호출 {calls}/{budget}", step.describe()));
             let request = Request::new(
                 prompt.clone(),
@@ -436,7 +445,7 @@ impl RunExecutor<'_> {
             phase: Phase::Plan,
             round: 0,
             provider: self.author,
-            reserve: 2,
+            reserve: TAIL + 1,
         };
         let source_ids: HashSet<_> = self
             .store
@@ -464,7 +473,8 @@ impl RunExecutor<'_> {
             self.run(),
             self.settings.search_enabled,
         );
-        let remaining = self.remaining().saturating_sub(1);
+        // Tasks the plan may contain: everything except this call and the reader report.
+        let remaining = self.remaining().saturating_sub(2);
         let parsed = match self.call(step, context, schema::<Plan>()) {
             Ok(raw) => {
                 let parsed = parse(raw.clone(), remaining);
@@ -493,7 +503,7 @@ impl RunExecutor<'_> {
             Err(e) if is_fatal(&e.to_string()) => return Err(e),
             Err(e) => Err(e),
         };
-        if self.remaining() < 3 && parsed.is_err() {
+        if self.remaining() < 4 && parsed.is_err() {
             bail!("budget_exhausted");
         }
         let mut plan = match parsed {
@@ -573,7 +583,7 @@ impl RunExecutor<'_> {
             } else {
                 self.author
             },
-            reserve: 1,
+            reserve: TAIL,
         };
         let run = self.run();
         let missing = task.depends_on.iter().any(|id| {
@@ -600,9 +610,12 @@ impl RunExecutor<'_> {
         task
     }
     fn review(&mut self, plan: &Plan, round: u32) -> Result<bool> {
+        self.review_as(plan, round, format!("review-r{round}"))
+    }
+    fn review_as(&mut self, plan: &Plan, round: u32, task_id: String) -> Result<bool> {
         let task = self.round_task(
             plan,
-            format!("review-r{round}"),
+            task_id,
             Role::Critic,
             "작업 이론을 독립적으로 비판 검토하고 이전 비판에 대한 저자 응답을 판정한다.",
         );
@@ -627,7 +640,7 @@ impl RunExecutor<'_> {
             phase: Phase::Review,
             round,
             provider: self.critic,
-            reserve: 1,
+            reserve: TAIL,
         };
         Ok(self.step(step, &task, context)?.is_some())
     }
@@ -652,15 +665,14 @@ impl RunExecutor<'_> {
             phase: Phase::Revise,
             round,
             provider: self.author,
-            reserve: 2,
+            reserve: TAIL + 1,
         };
         Ok(self.step(step, &task, context)?.is_some())
     }
-    /// Observed time per model call in this run (at least a minute before any data).
+    /// Observed time per model call in this session (at least a minute before any data).
     fn per_call(&self) -> Duration {
-        let run = self.run();
-        let elapsed = now().saturating_sub(run.started);
-        Duration::from_secs((elapsed / u64::from(run.calls.max(1))).max(60))
+        let calls = self.run().calls.saturating_sub(self.calls_before).max(1);
+        Duration::from_secs((self.began.elapsed().as_secs() / u64::from(calls)).max(60))
     }
     fn reviewed(&self) -> bool {
         self.run()
@@ -674,15 +686,15 @@ impl RunExecutor<'_> {
     }
     /// The recursive author ↔ critic exchange.
     fn deliberate(&mut self, plan: &Plan) -> Result<()> {
-        let max = self.run().budget.rounds();
-        self.run_mut().deliberation.max_rounds = max;
+        let max = self.run().deliberation.max_rounds;
+        let resumed_at = self.run().deliberation.resumed_at;
         let drafted = !self.run().theory().is_empty()
             || self
                 .run()
                 .attempts
                 .iter()
                 .any(|a| a.state == TaskState::Succeeded && a.phase == Some(Phase::Construct));
-        if !self.reviewed() && drafted && self.critic_down.is_none() && self.remaining() >= 2 {
+        if !self.reviewed() && drafted && self.critic_down.is_none() && self.remaining() > TAIL {
             self.review(plan, 0)?;
         }
         loop {
@@ -696,7 +708,7 @@ impl RunExecutor<'_> {
                 .run()
                 .critiques
                 .iter()
-                .filter(|c| c.actionable())
+                .filter(|c| c.actionable_since(resumed_at))
                 .map(|c| c.id.clone())
                 .collect();
             if focus.is_empty() {
@@ -715,11 +727,11 @@ impl RunExecutor<'_> {
             if done >= max {
                 return self.stop(StopReason::RoundLimit);
             }
-            if self.remaining() < 3 {
+            if self.remaining() < 2 + TAIL {
                 return self.stop(StopReason::Budget);
             }
-            // A round is revise + review, and synthesis must still fit afterwards.
-            if self.deadline.saturating_duration_since(Instant::now()) < self.per_call() * 3 {
+            // A round is revise + review, and synthesis and the report must still fit afterwards.
+            if self.deadline.saturating_duration_since(Instant::now()) < self.per_call() * 4 {
                 return self.stop(StopReason::Budget);
             }
             let round = done + 1;
@@ -758,7 +770,7 @@ impl RunExecutor<'_> {
             phase: Phase::Synthesis,
             round: self.run().deliberation.rounds,
             provider: self.author,
-            reserve: 0,
+            reserve: 1,
         };
         let context = synthesis_context(&self.store.project, self.run(), task);
         if let Some(output) = self.step(step, task, context)? {
@@ -770,6 +782,148 @@ impl RunExecutor<'_> {
                 RunState::Answered
             };
             self.store.save("최종 답변 저장")?;
+        }
+        Ok(())
+    }
+    /// The scribe rewrites the outcome for the reader. A failure here never changes the
+    /// research result; the app then shows the synthesis with a button to try again.
+    fn write_report(&mut self) -> Result<()> {
+        let run = self.run();
+        if run.theory().is_empty() && run.final_output().is_none() {
+            return Ok(());
+        }
+        let cited = reader::cited_sources(run);
+        if self.settings.search_enabled && !cited.is_empty() {
+            self.emit("인용 문헌의 서지 정보 확인".into());
+            let deadline = self.deadline.min(Instant::now() + Duration::from_secs(40));
+            let warnings = crate::search::enrich_bibliography(
+                &mut self.store.project.sources,
+                &cited,
+                self.cancel,
+                deadline,
+            );
+            ensure!(!self.cancel.load(Ordering::SeqCst), "cancelled");
+            self.run_mut().limitations.extend(warnings);
+        }
+        let keys = reader::citation_keys(&self.store.project, &cited);
+        let bib_needed: Vec<String> = cited
+            .iter()
+            .filter(|id| {
+                self.store.project.sources.iter().any(|s| {
+                    s.id == **id
+                        && s.access != Access::MetadataOnly
+                        && s.derived_bib().authors.is_empty()
+                        && s.derived_bib().origin == "file"
+                })
+            })
+            .take(6)
+            .cloned()
+            .collect();
+        let context = reader::report_context(&self.store.project, self.run(), &keys, &bib_needed);
+        let step = Step {
+            task_id: "report",
+            role: None,
+            phase: Phase::Report,
+            round: self.run().deliberation.rounds,
+            provider: self.author,
+            reserve: 0,
+        };
+        let raw = match self.call(step, context, schema::<ReaderReport>()) {
+            Ok(raw) => raw,
+            Err(e) => {
+                let message = e.to_string();
+                if message == "cancelled" {
+                    return Err(e);
+                }
+                if message == CALL_BUDGET || message == CONTEXT_LIMIT {
+                    let task = TaskSpec::new("report", Role::Synthesizer, "읽기 쉬운 보고서");
+                    self.block(&task, step, message.clone())?;
+                    // Not a research task: its absence never makes the answer partial.
+                    self.run_mut().attempts.last_mut().unwrap().role = None;
+                }
+                self.run_mut()
+                    .limitations
+                    .push(format!("읽기 쉬운 보고서를 만들지 못했습니다: {message}"));
+                return self.store.save("보고서 작성 실패 기록");
+            }
+        };
+        let mut notes = vec![];
+        let outcome = (|| -> Result<ReaderReport> {
+            let mut report: ReaderReport = serde_json::from_value(raw)?;
+            ensure!(
+                !report.answer.trim().is_empty(),
+                "보고서의 답변이 비어 있습니다"
+            );
+            // Printed metadata the scribe copied, kept only where the source shows it.
+            for c in std::mem::take(&mut report.bibliography) {
+                let Some((id, _)) = keys
+                    .iter()
+                    .find(|(id, k)| **k == c.key && bib_needed.contains(id))
+                else {
+                    continue;
+                };
+                if let Some(s) = self.store.project.sources.iter_mut().find(|s| s.id == *id)
+                    && let Some(b) = verify_candidate(s, &c, &mut notes)
+                {
+                    s.bib = Some(b);
+                }
+            }
+            // Better metadata may give better keys; rename before the keys are frozen.
+            let fresh = reader::citation_keys(&self.store.project, &cited);
+            let renames: HashMap<String, String> = keys
+                .iter()
+                .filter_map(|(id, old)| Some((old.clone(), fresh.get(id)?.clone())))
+                .filter(|(old, new)| old != new)
+                .collect();
+            if !renames.is_empty() {
+                report.map_text(|t| rename_citations(t, &renames));
+            }
+            for (id, key) in &fresh {
+                if let Some(s) = self.store.project.sources.iter_mut().find(|s| s.id == *id) {
+                    let mut b = s.derived_bib();
+                    b.key = key.clone();
+                    s.bib = Some(b);
+                }
+            }
+            let vocabulary =
+                reader::vocabulary(&self.store.project, self.run(), fresh.into_values());
+            notes.extend(report.sanitize(&vocabulary));
+            Ok(report)
+        })();
+        let model = self.settings.model(self.author).to_string();
+        let provider = self.author.label().to_string();
+        let round = self.run().deliberation.rounds;
+        let run = self.run_mut();
+        let a = run.attempts.last_mut().unwrap();
+        a.validation_notes = notes.clone();
+        match outcome {
+            Ok(report) => {
+                a.state = TaskState::Succeeded;
+                a.error = None;
+                let model = if a.model.is_empty() {
+                    model
+                } else {
+                    a.model.clone()
+                };
+                run.reading = Some(record::<Reading>(|r| {
+                    r.report = report;
+                    r.provider = provider;
+                    r.model = model;
+                    r.written = now();
+                    r.round = round;
+                    r.notes = notes;
+                }));
+                self.store.save("읽기 쉬운 보고서 저장")?;
+                self.emit("읽기 쉬운 보고서 작성 완료".into());
+            }
+            Err(e) => {
+                a.state = TaskState::Failed;
+                a.error = Some(e.to_string());
+                run.limitations.push(format!(
+                    "읽기 쉬운 보고서가 형식 검증을 통과하지 못했습니다: {e}"
+                ));
+                self.store.save("보고서 검증 실패")?;
+            }
         }
         Ok(())
     }
@@ -803,8 +957,206 @@ impl RunExecutor<'_> {
             bail!("cancelled");
         }
         self.deliberate(&plan)?;
-        self.synthesize(&plan.tasks[*last])
+        self.synthesize(&plan.tasks[*last])?;
+        self.write_report()
     }
+    /// More rounds on a finished run: dissent gets another chance and the user's direction,
+    /// if any, steers both models. The answer and report are rewritten only if the theory
+    /// or the critiques changed.
+    fn continue_debate(&mut self, previous: RunState) -> Result<()> {
+        let plan = self.run().plan.clone().expect("checked by resume");
+        let resumed_at = self.run().deliberation.resumed_at;
+        let fingerprint = |r: &Run| {
+            (
+                r.theory().into_iter().map(|p| p.id).collect::<Vec<_>>(),
+                r.critiques
+                    .iter()
+                    .map(|c| (c.id.clone(), c.status))
+                    .collect::<Vec<_>>(),
+            )
+        };
+        let before = fingerprint(self.run());
+        let actionable = self
+            .run()
+            .critiques
+            .iter()
+            .any(|c| c.actionable_since(resumed_at));
+        if !actionable && self.critic_down.is_none() {
+            // Nothing left to answer: the critic first re-examines the theory, with the
+            // user's direction, and may raise new objections.
+            let round = resumed_at + 1;
+            if !self.review_as(&plan, round, format!("reopen-r{round}"))? {
+                self.run_mut().state = previous;
+                return self.stop(StopReason::Failed);
+            }
+        }
+        self.deliberate(&plan)?;
+        if fingerprint(self.run()) == before {
+            let r = self.run_mut();
+            r.state = previous;
+            r.limitations.push(
+                "추가 토론에서 이론과 비판이 바뀌지 않아 기존 답변과 보고서를 유지했습니다".into(),
+            );
+            return self.store.save("추가 토론 · 변화 없음");
+        }
+        let last = plan
+            .tasks
+            .iter()
+            .rev()
+            .find(|t| t.kind == Role::Synthesizer)
+            .cloned()
+            .unwrap_or_else(|| {
+                TaskSpec::new("answer", Role::Synthesizer, "직접적인 답변을 종합한다.")
+            });
+        self.synthesize(&last)?;
+        if self.run().state == RunState::Running {
+            let r = self.run_mut();
+            r.state = previous;
+            r.limitations
+                .push("추가 토론 뒤 종합이 검증을 통과하지 못해 이전 답변을 유지했습니다".into());
+        }
+        self.write_report()
+    }
+    /// Common end of a run or a continuation: final state, notes, and new ledger proposals.
+    fn finalize(&mut self, result: Result<()>, base_revision: u64) -> Result<()> {
+        let cancel = self.cancel;
+        let deadline = self.deadline;
+        let run_ix = self.run_ix;
+        let p = &mut self.store.project;
+        let r = &mut p.runs[run_ix];
+        if let Err(e) = result {
+            let message = e.to_string();
+            r.state = if cancel.load(Ordering::SeqCst) || message == "cancelled" {
+                RunState::Cancelled
+            } else if Instant::now() >= deadline || message == "budget_exhausted" {
+                RunState::BudgetExhausted
+            } else {
+                RunState::Failed
+            };
+            if r.deliberation.stop.is_none() && r.state == RunState::Cancelled {
+                r.deliberation.stop = Some(StopReason::Cancelled);
+            }
+            r.limitations.push(message);
+        }
+        let initial_failed = r.attempts.iter().any(|a| {
+            a.role.is_some()
+                && a.round == 0
+                && a.phase != Some(Phase::Synthesis)
+                && matches!(a.state, TaskState::Failed | TaskState::Blocked)
+                && !r
+                    .attempts
+                    .iter()
+                    .any(|b| b.task_id == a.task_id && b.state == TaskState::Succeeded)
+        });
+        let debate_failed = r.deliberation.stop == Some(StopReason::Failed);
+        let partial_note =
+            "일부 분석·비판 작업이 실패해 토론이 완결되지 않았습니다. 종합 답변은 부분 결과입니다.";
+        if matches!(r.state, RunState::Answered | RunState::EvidenceInsufficient)
+            && (initial_failed || debate_failed)
+        {
+            r.state = RunState::Partial;
+            if !r.limitations.iter().any(|l| l == partial_note) {
+                r.limitations.push(partial_note.into());
+            }
+        }
+        if r.state == RunState::Running {
+            r.state = RunState::Failed;
+            r.limitations
+                .push("종합 작업이 검증을 통과하지 못했습니다".into());
+        }
+        if r.report.is_empty() {
+            r.report = fallback_report(r);
+        }
+        if let Some(stop) = r.deliberation.stop {
+            r.limitations.retain(|l| !l.starts_with("토론: "));
+            r.limitations.push(format!(
+                "토론: {} → {} · {}회 수정 · {}",
+                ProviderKind::from_label(&r.deliberation.author).display(),
+                ProviderKind::from_label(&r.deliberation.critic).display(),
+                r.deliberation.rounds,
+                stop.label()
+            ));
+        }
+        r.finished = Some(now());
+        // The user-facing ledger receives only the latest validated proposals, never adoptions.
+        let conflict = p.revision != base_revision;
+        if !cancel.load(Ordering::SeqCst) {
+            let last_review = r
+                .attempts
+                .iter()
+                .rposition(|a| a.phase == Some(Phase::Review) && a.state == TaskState::Succeeded);
+            let origin: HashMap<&str, (usize, &str)> = r
+                .attempts
+                .iter()
+                .enumerate()
+                .filter_map(|(i, a)| a.output.as_ref().map(|o| (i, a, o)))
+                .flat_map(|(i, a, o)| {
+                    o.proposed_changes
+                        .iter()
+                        .map(move |p| (p.id.as_str(), (i, a.task_id.as_str())))
+                })
+                .collect();
+            let disputed: HashSet<&str> = r
+                .critiques
+                .iter()
+                .filter(|c| c.material() && !c.status.is_settled())
+                .map(|c| c.critique.target_id.as_str())
+                .collect();
+            let mut ids: HashSet<_> = p.entries.iter().map(|e| e.proposal.id.clone()).collect();
+            for proposal in r.theory() {
+                if !ids.insert(proposal.id.clone()) {
+                    continue;
+                }
+                let (at, task_id) = origin
+                    .get(proposal.id.as_str())
+                    .copied()
+                    .unwrap_or((usize::MAX, ""));
+                let review = if conflict {
+                    Review::NeedsReview
+                } else if disputed.contains(proposal.id.as_str()) {
+                    Review::Contested
+                } else if last_review.is_some_and(|l| at < l) {
+                    Review::Reviewed
+                } else {
+                    Review::Unreviewed
+                };
+                p.entries.push(record::<Entry>(|e| {
+                    e.proposal = proposal.clone();
+                    e.adoption = Adoption::Proposed;
+                    e.review = review;
+                    e.revision = p.revision + 1;
+                    e.run_id = r.id.clone();
+                    e.task_id = task_id.into();
+                }));
+            }
+        }
+        let conflict_note =
+            "기준 판본 이후 편집 감지: 채택 상태를 변경하지 않고 재검토 제안으로 보존";
+        if conflict && !r.limitations.iter().any(|l| l == conflict_note) {
+            r.limitations.push(conflict_note.into());
+        }
+        p.checkpoint("질문 실행 산출물 — 채택 전 제안");
+        p.runs[run_ix].revision = p.revision;
+        self.store.save("실행 종료 및 원장 제안 기록")?;
+        self.emit(self.store.project.runs[run_ix].state.label().into());
+        Ok(())
+    }
+}
+/// Rewrite citation keys inside `[@…]` groups.
+fn rename_citations(text: &str, renames: &HashMap<String, String>) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut last = 0;
+    for (start, end, inner) in citation_groups(text) {
+        out.push_str(&text[last..start]);
+        let mut group = inner.to_string();
+        for (old, new) in renames {
+            group = replace_token(&group, &format!("@{old}"), &format!("@{new}"));
+        }
+        out.push_str(&format!("[{group}]"));
+        last = end;
+    }
+    out.push_str(&text[last..]);
+    out
 }
 pub struct RunInput {
     question: String,
@@ -899,128 +1251,248 @@ pub fn run(
         cancel,
         notify,
         deadline: Instant::now() + Duration::from_secs(budget.seconds()),
+        began: Instant::now(),
+        calls_before: 0,
         run_ix,
         author,
         critic,
         critic_down: None,
     };
     let result = executor.execute();
-    let p = &mut executor.store.project;
-    let r = &mut p.runs[run_ix];
-    if let Err(e) = result {
-        let message = e.to_string();
-        r.state = if cancel.load(Ordering::SeqCst) || message == "cancelled" {
-            RunState::Cancelled
-        } else if Instant::now() >= executor.deadline || message == "budget_exhausted" {
-            RunState::BudgetExhausted
-        } else {
-            RunState::Failed
-        };
-        if r.deliberation.stop.is_none() && r.state == RunState::Cancelled {
-            r.deliberation.stop = Some(StopReason::Cancelled);
+    executor.finalize(result, base_revision)
+}
+/// What the user adds when continuing a finished debate.
+pub struct ContinueInput {
+    rounds: u32,
+    direction: String,
+}
+impl ContinueInput {
+    pub fn new(rounds: u32, direction: impl Into<String>) -> Self {
+        Self {
+            rounds,
+            direction: direction.into(),
         }
-        r.limitations.push(message);
     }
-    let initial_failed = r.attempts.iter().any(|a| {
-        a.role.is_some()
-            && a.round == 0
-            && a.phase != Some(Phase::Synthesis)
-            && matches!(a.state, TaskState::Failed | TaskState::Blocked)
-            && !r
-                .attempts
-                .iter()
-                .any(|b| b.task_id == a.task_id && b.state == TaskState::Succeeded)
-    });
-    let debate_failed = r.deliberation.stop == Some(StopReason::Failed);
-    if matches!(r.state, RunState::Answered | RunState::EvidenceInsufficient)
-        && (initial_failed || debate_failed)
+}
+/// An executor for further work on an existing run, with its original model pairing.
+fn executor_for<'a>(
+    store: &'a mut Store,
+    run_id: &str,
+    settings: &'a Settings,
+    provider: &'a dyn ModelProvider,
+    cancel: &'a Cancel,
+    notify: &'a mut dyn FnMut(&Project, String),
+    seconds: u64,
+) -> Result<RunExecutor<'a>> {
+    let run_ix = store
+        .project
+        .runs
+        .iter()
+        .position(|r| r.id == run_id)
+        .ok_or_else(|| anyhow::anyhow!("질문을 찾지 못했습니다"))?;
+    let run = &store.project.runs[run_ix];
+    ensure!(
+        run.state != RunState::Running,
+        "이 질문은 아직 실행 중입니다"
+    );
+    let author = if run.deliberation.author.is_empty() {
+        settings.primary
+    } else {
+        ProviderKind::from_label(&run.deliberation.author)
+    };
+    let critic = if run.deliberation.critic.is_empty() {
+        author
+    } else {
+        ProviderKind::from_label(&run.deliberation.critic)
+    };
+    let calls_before = run.calls;
+    Ok(RunExecutor {
+        store,
+        provider,
+        settings,
+        cancel,
+        notify,
+        deadline: Instant::now() + Duration::from_secs(seconds),
+        began: Instant::now(),
+        calls_before,
+        run_ix,
+        author,
+        critic,
+        critic_down: None,
+    })
+}
+/// Continue a finished debate for more rounds, optionally steered by the user.
+pub fn resume(
+    store: &mut Store,
+    run_id: &str,
+    input: ContinueInput,
+    settings: &Settings,
+    provider: &dyn ModelProvider,
+    cancel: &Cancel,
+    notify: &mut dyn FnMut(&Project, String),
+) -> Result<()> {
+    let ContinueInput { rounds, direction } = input;
+    ensure!((1..=6).contains(&rounds), "추가 회차는 1–6회입니다");
+    ensure!(direction.len() <= 8000, "방향 메모가 너무 깁니다");
     {
-        r.state = RunState::Partial;
-        r.limitations.push(
-            "일부 분석·비판 작업이 실패해 토론이 완결되지 않았습니다. 종합 답변은 부분 결과입니다."
-                .into(),
+        let run = store
+            .project
+            .runs
+            .iter()
+            .find(|r| r.id == run_id)
+            .ok_or_else(|| anyhow::anyhow!("질문을 찾지 못했습니다"))?;
+        ensure!(
+            run.plan.is_some() && !run.theory().is_empty(),
+            "이어 갈 작업 이론이 없습니다. 새 질문으로 실행하세요"
         );
     }
-    if r.state == RunState::Running {
-        r.state = RunState::Failed;
-        r.limitations
-            .push("종합 작업이 검증을 통과하지 못했습니다".into());
-    }
-    if r.report.is_empty() {
-        r.report = fallback_report(r);
-    }
-    if let Some(stop) = r.deliberation.stop {
-        r.limitations.push(format!(
-            "토론: {} → {} · {}회 수정 · {}",
-            ProviderKind::from_label(&r.deliberation.author).display(),
-            ProviderKind::from_label(&r.deliberation.critic).display(),
-            r.deliberation.rounds,
-            stop.label()
-        ));
-    }
-    r.finished = Some(now());
-    // The user-facing ledger receives only the latest validated proposals, never adoptions.
-    let conflict = p.revision != base_revision;
-    if !cancel.load(Ordering::SeqCst) {
-        let last_review = r
-            .attempts
-            .iter()
-            .rposition(|a| a.phase == Some(Phase::Review) && a.state == TaskState::Succeeded);
-        let origin: HashMap<&str, (usize, &str)> = r
-            .attempts
-            .iter()
-            .enumerate()
-            .filter_map(|(i, a)| a.output.as_ref().map(|o| (i, a, o)))
-            .flat_map(|(i, a, o)| {
-                o.proposed_changes
-                    .iter()
-                    .map(move |p| (p.id.as_str(), (i, a.task_id.as_str())))
-            })
-            .collect();
-        let disputed: HashSet<&str> = r
-            .critiques
-            .iter()
-            .filter(|c| c.material() && !c.status.is_settled())
-            .map(|c| c.critique.target_id.as_str())
-            .collect();
-        let mut ids: HashSet<_> = p.entries.iter().map(|e| e.proposal.id.clone()).collect();
-        for proposal in r.theory() {
-            if !ids.insert(proposal.id.clone()) {
-                continue;
-            }
-            let (at, task_id) = origin
-                .get(proposal.id.as_str())
-                .copied()
-                .unwrap_or((usize::MAX, ""));
-            let review = if conflict {
-                Review::NeedsReview
-            } else if disputed.contains(proposal.id.as_str()) {
-                Review::Contested
-            } else if last_review.is_some_and(|l| at < l) {
-                Review::Reviewed
-            } else {
-                Review::Unreviewed
-            };
-            p.entries.push(record::<Entry>(|e| {
-                e.proposal = proposal.clone();
-                e.adoption = Adoption::Proposed;
-                e.review = review;
-                e.revision = p.revision + 1;
-                e.run_id = r.id.clone();
-                e.task_id = task_id.into();
+    // Two calls per round, plus a possible fresh review, the synthesis and the report.
+    let seconds = (u64::from(2 * rounds + 3) * 240).max(900);
+    let base_revision = store.project.revision;
+    let mut executor = executor_for(store, run_id, settings, provider, cancel, notify, seconds)?;
+    let previous = executor.run().state;
+    {
+        let r = executor.run_mut();
+        let done = r.deliberation.rounds;
+        r.state = RunState::Running;
+        r.finished = None;
+        r.extra_calls += 2 * rounds + TAIL + 1;
+        r.deliberation.max_rounds = done + rounds;
+        r.deliberation.resumed_at = done;
+        r.deliberation.continuations += 1;
+        r.deliberation.stop = None;
+        let direction = direction.trim();
+        if !direction.is_empty() {
+            r.directions.push(record::<Direction>(|d| {
+                d.round = done + 1;
+                d.text = direction.into();
+                d.given = now();
             }));
         }
     }
-    if conflict {
-        r.limitations.push(
-            "기준 판본 이후 편집 감지: 채택 상태를 변경하지 않고 재검토 제안으로 보존".into(),
-        );
+    executor.store.save("토론 이어 가기")?;
+    executor.emit("토론을 이어 갑니다".into());
+    let result = executor.continue_debate(previous);
+    executor.finalize(result, base_revision)
+}
+/// (Re)write the reader report for an existing run — for runs made before the scribe
+/// existed, or after a failed report.
+pub fn write_report(
+    store: &mut Store,
+    run_id: &str,
+    settings: &Settings,
+    provider: &dyn ModelProvider,
+    cancel: &Cancel,
+    notify: &mut dyn FnMut(&Project, String),
+) -> Result<()> {
+    let mut executor = executor_for(store, run_id, settings, provider, cancel, notify, 600)?;
+    executor.run_mut().extra_calls += 1;
+    executor
+        .run_mut()
+        .limitations
+        .retain(|l| !l.starts_with("읽기 쉬운 보고서"));
+    executor.store.save("보고서 작성 요청")?;
+    let result = executor.write_report();
+    if executor.run().reading.is_none() {
+        let reason = executor
+            .run()
+            .limitations
+            .iter()
+            .rev()
+            .find(|l| l.starts_with("읽기 쉬운 보고서"))
+            .cloned();
+        result?;
+        bail!(reason.unwrap_or_else(|| "보고서를 만들 작업 이론이 없습니다".into()));
     }
-    p.checkpoint("질문 실행 산출물 — 채택 전 제안");
-    p.runs[run_ix].revision = p.revision;
-    executor.store.save("실행 종료 및 원장 제안 기록")?;
-    executor.emit(executor.store.project.runs[run_ix].state.label().into());
-    Ok(())
+    result
+}
+/// Answer a follow-up question about a finished report (one call).
+pub fn ask(
+    store: &mut Store,
+    run_id: &str,
+    question: &str,
+    settings: &Settings,
+    provider: &dyn ModelProvider,
+    cancel: &Cancel,
+    notify: &mut dyn FnMut(&Project, String),
+) -> Result<()> {
+    let question = question.trim();
+    ensure!(!question.is_empty(), "질문을 입력하세요");
+    ensure!(question.len() <= 6000, "질문이 너무 깁니다");
+    // Older runs have no frozen citation keys yet; the answer may cite only frozen ones.
+    store.freeze_citation_keys(&[run_id.to_string()])?;
+    let mut executor = executor_for(store, run_id, settings, provider, cancel, notify, 300)?;
+    executor.run_mut().extra_calls += 1;
+    let context = reader::ask_context(&executor.store.project, executor.run(), question);
+    let step = Step {
+        task_id: "ask",
+        role: None,
+        phase: Phase::Ask,
+        round: executor.run().deliberation.rounds,
+        provider: executor.author,
+        reserve: 0,
+    };
+    let result = executor
+        .call(step, context, schema::<FollowUpAnswer>())
+        .and_then(|raw| Ok(serde_json::from_value::<FollowUpAnswer>(raw)?));
+    let keys: Vec<String> = reader::cited_sources(executor.run())
+        .iter()
+        .filter_map(|id| {
+            let s = executor
+                .store
+                .project
+                .sources
+                .iter()
+                .find(|s| s.id == *id)?;
+            Some(s.bib.as_ref()?.key.clone()).filter(|k| !k.is_empty())
+        })
+        .collect();
+    let vocabulary = reader::vocabulary(&executor.store.project, executor.run(), keys);
+    let provider_label = executor.author.label().to_string();
+    let mut notes = vec![];
+    let run = executor.run_mut();
+    let a = run
+        .attempts
+        .last_mut()
+        .filter(|a| a.phase == Some(Phase::Ask));
+    let follow = match &result {
+        Ok(answer) => {
+            let text = vocabulary.clean(&answer.answer, &mut notes);
+            if let Some(a) = a {
+                a.state = TaskState::Succeeded;
+                a.validation_notes = notes;
+            }
+            record::<FollowUp>(|f| {
+                f.question = question.into();
+                f.answer = text;
+                f.needs_research = answer.needs_research;
+                f.suggested_direction = vocabulary.clean(&answer.suggested_direction, &mut vec![]);
+                f.provider = provider_label;
+                f.asked = now();
+            })
+        }
+        Err(e) => {
+            if let Some(a) = a
+                && a.state == TaskState::Validating
+            {
+                a.state = TaskState::Failed;
+                a.error = Some(e.to_string());
+            }
+            record::<FollowUp>(|f| {
+                f.question = question.into();
+                f.provider = provider_label;
+                f.asked = now();
+                f.error = Some(e.to_string());
+            })
+        }
+    };
+    run.followups.push(follow);
+    executor.store.save("후속 질문 기록")?;
+    executor.emit("후속 질문 답변 완료".into());
+    match result {
+        Err(e) if e.to_string() == "cancelled" => Err(e),
+        _ => Ok(()),
+    }
 }
 fn render_answer(o: &Envelope) -> String {
     let mut s = o.summary.clone();

@@ -12,11 +12,12 @@ pub enum Budget {
     Deep,
 }
 impl Budget {
+    /// Model calls, including the scribe's reader report at the end.
     pub fn calls(self) -> u32 {
         match self {
-            Self::Quick => 4,
-            Self::Standard => 12,
-            Self::Deep => 24,
+            Self::Quick => 5,
+            Self::Standard => 13,
+            Self::Deep => 25,
         }
     }
     /// Wall-clock limit. Debate rounds take two calls each, so these exceed the
@@ -45,16 +46,16 @@ impl Budget {
     }
     pub fn label(self) -> &'static str {
         match self {
-            Self::Quick => "빠르게 · 4회",
-            Self::Standard => "표준 · 12회",
-            Self::Deep => "깊게 · 24회",
+            Self::Quick => "빠르게 · 5회",
+            Self::Standard => "표준 · 13회",
+            Self::Deep => "깊게 · 25회",
         }
     }
     pub fn detail(self) -> &'static str {
         match self {
-            Self::Quick => "호출 4회 · 8분 · 비판 1회, 수정 없음",
-            Self::Standard => "호출 12회 · 25분 · 비판↔수정 최대 2회",
-            Self::Deep => "호출 24회 · 50분 · 비판↔수정 최대 4회",
+            Self::Quick => "호출 5회 · 8분 · 비판 1회, 수정 없음 · 읽기 쉬운 보고서",
+            Self::Standard => "호출 13회 · 25분 · 비판↔수정 최대 2회 · 읽기 쉬운 보고서",
+            Self::Deep => "호출 25회 · 50분 · 비판↔수정 최대 4회 · 읽기 쉬운 보고서",
         }
     }
 }
@@ -292,6 +293,20 @@ mod tests {
         }
         let s = schema::<crate::Envelope>();
         check(&s);
+        check(&schema::<crate::ReaderReport>());
+        check(&schema::<crate::FollowUpAnswer>());
+        let report = schema::<crate::ReaderReport>();
+        assert_eq!(
+            report["$defs"]["NextKind"]["enum"],
+            serde_json::json!([
+                "experiment",
+                "data_analysis",
+                "theory",
+                "reading",
+                "ask_here"
+            ])
+        );
+        assert!(!report.to_string().contains("oneOf"));
         assert_eq!(
             s["$defs"]["CritiqueSeverity"]["enum"],
             serde_json::json!(["low", "medium", "high"])

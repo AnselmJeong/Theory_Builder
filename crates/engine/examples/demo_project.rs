@@ -115,7 +115,9 @@ impl ModelProvider for Script {
     ) -> Result<Response> {
         progress("데모 스크립트 응답".into());
         let c: Value = serde_json::from_str(&r.prompt)?;
-        let phase = if c.get("final_theory").is_some() {
+        let phase = if let Some(request) = c.get("request").and_then(|r| r.as_str()) {
+            request.to_string()
+        } else if c.get("final_theory").is_some() {
             "synthesis".to_string()
         } else if let Some(d) = c.get("deliberation").filter(|d| d.get("phase").is_some()) {
             format!("{}-r{}", d["phase"].as_str().unwrap(), d["round"])
@@ -457,6 +459,11 @@ impl ModelProvider for Script {
                 o.next_actions = vec!["코르티솔 정상화와 맥락 전환 학습률 회복의 시간 순서를 같은 표본에서 추적한 연구 확인".into(), "'부정적 끌개' 용어 정의 또는 제거".into()];
                 serde_json::to_value(o)?
             }
+            "reader_report" => serde_json::to_value(reader_report(&c))?,
+            "follow_up" => serde_json::to_value(record::<FollowUpAnswer>(|a| {
+                a.answer = "(데모 응답) 가시 밀도는 쥐에서 스트레스가 끝나고 약 3주 안에 회복되었다고 보고되었습니다. 그래서 가소성 저하 *하나만으로*는 몇 달씩 이어지는 삽화를 설명하기 어렵고, 회복을 늦추는 다른 느린 과정 — 여기서는 코르티솔 조절 — 이 함께 필요하다고 본 것입니다.".into();
+                a.needs_research = false;
+            }))?,
             other => bail!("demo script has no step {other}"),
         };
         let mut response = Response::default();
@@ -464,6 +471,179 @@ impl ModelProvider for Script {
         response.model = "demo-script (가상 응답)".into();
         Ok(response)
     }
+}
+/// A scripted scribe report for the demo question (not model output).
+fn reader_report(c: &Value) -> ReaderReport {
+    let key = |needle: &str| {
+        c["references"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["title"].as_str().unwrap_or_default().contains(needle))
+            .map(|r| format!("@{}", r["key"].as_str().unwrap()))
+            .unwrap_or_default()
+    };
+    let (a, b) = (key("가시 밀도"), key("코르티솔"));
+    let node = |id: &str, label: &str, group: &str, note: &str| {
+        record::<DiagramNode>(|n| {
+            n.id = id.into();
+            n.label = label.into();
+            n.group = group.into();
+            n.note = note.into();
+        })
+    };
+    let edge = |from: &str, to: &str, label: &str, dashed: bool| {
+        record::<DiagramEdge>(|e| {
+            e.from = from.into();
+            e.to = to.into();
+            e.label = label.into();
+            e.dashed = dashed;
+        })
+    };
+    record::<ReaderReport>(|r| {
+        r.title = "스트레스 가소성과 느린 호르몬 회복의 결합 가설".into();
+        r.answer = format!(
+            "(데모용 가상 보고서) **가능하지만 조건부입니다.** 해마의 시냅스 가소성이 떨어지는 것만으로는 삽화가 길어지는 이유를 설명하기 어렵습니다. 쥐에서는 몇 주 만에 회복되기 때문입니다 [{a}]. 대신 *스트레스 호르몬 조절이 느리게 회복되면 가소성 회복도 늦어져 삽화가 길어진다*는 결합 가설이 두 자료 모두와 어긋나지 않습니다 [{b}]."
+        );
+        r.key_points = vec![
+            record::<KeyPoint>(|k| {
+                k.heading = "동물에서 가소성 저하는 실제로 관찰되었다".into();
+                k.body = format!(
+                    "21일 동안 스트레스를 받은 쥐의 해마 CA3 뉴런에서 가시(시냅스가 붙는 돌기) 밀도가 줄고 장기강화(LTP)가 손상되었습니다 [{a}]. 다만 이 변화는 스트레스가 끝난 뒤 3주 안에 회복되었습니다."
+                );
+                k.standing = Standing::Supported;
+                k.figure_ids = vec!["F1".into()];
+            }),
+            record::<KeyPoint>(|k| {
+                k.heading = "사람에서는 호르몬 반응이 삽화 길이와 함께 움직였다".into();
+                k.body = format!(
+                    "주요우울장애 환자 212명에서 아침 코르티솔 반응이 둔한 사람일수록 삽화가 길었습니다 [{b}]. 하지만 이 코호트에서는 해마를 측정하지 않았습니다."
+                );
+                k.standing = Standing::Supported;
+            }),
+            record::<KeyPoint>(|k| {
+                k.heading = "둘을 잇는 고리는 아직 가설이다".into();
+                k.body = "‘호르몬 회복이 늦으면 가소성 회복도 늦다’는 연결은 같은 사람이나 동물에서 두 시간 경과를 함께 잰 적이 없어 검증되지 않았습니다. 반대 방향(가소성 저하가 호르몬 회복을 늦춤)도 같은 관찰을 낳을 수 있습니다.".into();
+                k.standing = Standing::Hypothesis;
+                k.figure_ids = vec!["F2".into()];
+            }),
+        ];
+        r.sections = vec![record::<Section>(|s| {
+            s.heading = "왜 ‘시간 척도’가 핵심인가".into();
+            s.body = "빨리 회복되는 변화는 오래가는 상태를 혼자 설명하지 못합니다. 욕조에 비유하면, 물이 빨리 빠지는 욕조는 수도꼭지를 잠그면 곧 비워집니다. 삽화가 몇 달 지속되려면 수도꼭지(스트레스 호르몬)가 천천히 잠기거나, 배수구(가소성 회복)가 함께 막혀 있어야 합니다.".into();
+        })];
+        r.figures = vec![
+            record::<Figure>(|f| {
+                f.id = "F1".into();
+                f.title = "세 수준과 그 사이의 연결".into();
+                f.caption =
+                    "실선은 자료로 보고된 관계, 점선은 아직 검증되지 않은 연결입니다.".into();
+                f.groups = vec![
+                    "세포·시냅스 (쥐)".into(),
+                    "신경내분비".into(),
+                    "임상 (사람)".into(),
+                ];
+                f.nodes = vec![
+                    node(
+                        "spine",
+                        "CA3 가시 밀도 감소",
+                        "세포·시냅스 (쥐)",
+                        "21일 스트레스 뒤 관찰, 3주 안에 회복.",
+                    ),
+                    node(
+                        "ltp",
+                        "LTP 손상",
+                        "세포·시냅스 (쥐)",
+                        "가시 감소와 함께 관찰된 기능 변화.",
+                    ),
+                    node(
+                        "hpa",
+                        "느린 코르티솔 회복",
+                        "신경내분비",
+                        "스트레스 종료 뒤에도 6일간 높게 유지(쥐).",
+                    ),
+                    node(
+                        "car",
+                        "각성 반응 둔화",
+                        "신경내분비",
+                        "사람 코호트에서 측정된 아침 코르티솔 반응.",
+                    ),
+                    node(
+                        "episode",
+                        "삽화 지속 기간",
+                        "임상 (사람)",
+                        "212명 코호트에서 각성 반응과 연관.",
+                    ),
+                ];
+                f.edges = vec![
+                    edge("spine", "ltp", "함께 관찰", false),
+                    edge("hpa", "spine", "회복 지연?", true),
+                    edge("car", "episode", "연관", false),
+                    edge("ltp", "episode", "가설", true),
+                ];
+            }),
+            record::<Figure>(|f| {
+                f.id = "F2".into();
+                f.kind = FigureKind::Table;
+                f.title = "경쟁하는 두 설명".into();
+                f.columns = vec!["설명".into(), "방향".into(), "구별하려면".into()];
+                f.rows = vec![
+                    vec![
+                        "호르몬 → 가소성".into(),
+                        "코르티솔이 먼저 정상화되고 그 뒤 학습률이 회복".into(),
+                        "같은 표본에서 두 시간 경과의 순서를 잰다".into(),
+                    ],
+                    vec![
+                        "가소성 → 호르몬".into(),
+                        "학습률이 먼저 회복되고 코르티솔이 뒤따름".into(),
+                        "가소성만 조작했을 때 호르몬이 바뀌는지 본다".into(),
+                    ],
+                ];
+            }),
+        ];
+        r.glossary = vec![
+            record::<GlossaryTerm>(|g| {
+                g.term = "장기강화(LTP)".into();
+                g.plain =
+                    "자극이 반복될 때 시냅스 연결이 오래 강해지는 현상. 학습의 세포 수준 모형."
+                        .into();
+            }),
+            record::<GlossaryTerm>(|g| {
+                g.term = "코르티솔 각성 반응".into();
+                g.plain = "잠에서 깬 뒤 30–45분 동안 코르티솔이 오르는 정도.".into();
+            }),
+        ];
+        r.open_questions = vec![record::<OpenQuestion>(|q| {
+            q.question = "사람의 해마 가소성은 얼마나 빨리 회복될까?".into();
+            q.why_it_matters =
+                "회복이 쥐처럼 빠르다면 가소성만으로는 긴 삽화를 설명할 수 없습니다.".into();
+            q.how_to_settle =
+                "같은 환자에서 회복기 동안 학습 과제 수행과 코르티솔을 반복 측정한 종단 자료."
+                    .into();
+        })];
+        r.next_steps = vec![
+            record::<NextStep>(|n| {
+                n.kind = NextKind::AskHere;
+                n.action = "가시 밀도 회복이 3주라는 것이 왜 가설을 약하게 만드나요?".into();
+                n.purpose = "시간 척도 논증을 예와 함께 다시 설명받습니다.".into();
+            }),
+            record::<NextStep>(|n| {
+                n.kind = NextKind::DataAnalysis;
+                n.action = "코르티솔과 기분을 함께 추적한 기존 종단 자료에서 정상화 시점의 순서를 비교한다.".into();
+                n.purpose = "두 방향 가운데 어느 쪽이 먼저인지 첫 단서를 얻습니다.".into();
+            }),
+            record::<NextStep>(|n| {
+                n.kind = NextKind::Experiment;
+                n.action =
+                    "동물에서 코르티솔 회복만 앞당겼을 때 가시 밀도 회복이 빨라지는지 측정한다."
+                        .into();
+                n.purpose = "빨라지면 ‘호르몬 → 가소성’ 방향을 지지합니다.".into();
+            }),
+        ];
+        r.how_made =
+            "(데모) 스크립트로 만든 가상 응답입니다. 실제 모델 출력이나 과학적 주장이 아닙니다."
+                .into();
+    })
 }
 fn main() -> Result<()> {
     let root = std::env::args()
@@ -519,6 +699,21 @@ fn main() -> Result<()> {
             );
         }
     }
+    let run_id = run.id.clone();
+    execution::ask(
+        &mut store,
+        &run_id,
+        "가시 밀도 회복이 3주라는 것이 왜 가설을 약하게 만드나요?",
+        &settings,
+        &Script,
+        &Arc::new(AtomicBool::new(false)),
+        &mut |_, s| eprintln!("{s}"),
+    )?;
+    let folder = store.export_report(
+        &root.join("exports"),
+        theory_engine::storage::ReportScope::Run(run_id),
+    )?;
+    println!("보고서 내보냄: {}", folder.display());
     let mut settings_file = Settings::default();
     settings_file.primary = ProviderKind::Claude;
     settings_file.cross_review = true;

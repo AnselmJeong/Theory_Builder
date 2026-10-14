@@ -53,9 +53,30 @@ pub enum Command {
         targets: Vec<String>,
         budget: Budget,
     },
+    /// More debate rounds on a finished question, optionally steered by the user.
+    Continue {
+        run_id: String,
+        rounds: u32,
+        direction: String,
+    },
+    /// A follow-up question about a finished report.
+    Ask {
+        run_id: String,
+        question: String,
+    },
+    /// (Re)write the reader report of a finished question.
+    WriteReport(String),
+    /// Open the interactive HTML report in the browser.
+    OpenReport(String),
     Adopt(String),
     Withdraw(String),
     Restore(u64),
+    /// Reader report folder: report.md, references.bib, report.html, figures.
+    ExportReport {
+        path: PathBuf,
+        scope: ReportScope,
+    },
+    /// Backup bundle including source files, for re-import.
     Export(PathBuf),
     ImportBundle(PathBuf),
     OpenSource(String),
@@ -101,6 +122,52 @@ impl Drop for Service {
     fn drop(&mut self) {
         self.cancel();
         let _ = self.sender.send(Command::Shutdown);
+    }
+}
+/// Complete authors and journal details of cited sources before they are frozen into a
+/// report (PubMed/Crossref, read-only). Skipped when literature search is off.
+fn enrich(
+    store: &mut Store,
+    run_ids: &[String],
+    settings: &Settings,
+    cancel: &Cancel,
+    updates: &Sender<Event>,
+) {
+    if !settings.search_enabled {
+        return;
+    }
+    let mut cited: Vec<String> = vec![];
+    for r in store
+        .project
+        .runs
+        .iter()
+        .filter(|r| run_ids.contains(&r.id))
+    {
+        for id in execution::reader::cited_sources(r) {
+            if !cited.contains(&id) {
+                cited.push(id);
+            }
+        }
+    }
+    if cited.is_empty() {
+        return;
+    }
+    let _ = updates.send(Event::Status("인용 문헌의 서지 정보 확인".into()));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let before = store.project.sources.clone();
+    let warnings =
+        crate::search::enrich_bibliography(&mut store.project.sources, &cited, cancel, deadline);
+    for w in warnings {
+        let _ = updates.send(Event::Status(w));
+    }
+    let changed = store
+        .project
+        .sources
+        .iter()
+        .zip(&before)
+        .any(|(a, b)| a.bib != b.bib);
+    if changed {
+        let _ = store.save("인용 문헌 서지 정보 보완");
     }
 }
 fn serve(
@@ -380,7 +447,82 @@ fn serve(
                 }
                 Command::Export(path) => {
                     let bundle = store.export(&path)?;
-                    updates.send(Event::Status(format!("내보냄: {}", bundle.display())))?;
+                    updates.send(Event::Status(format!(
+                        "백업 bundle 저장: {}",
+                        bundle.display()
+                    )))?;
+                }
+                Command::ExportReport { path, scope } => {
+                    let runs: Vec<String> = match &scope {
+                        ReportScope::Run(id) => vec![id.clone()],
+                        ReportScope::Project => {
+                            store.project.runs.iter().map(|r| r.id.clone()).collect()
+                        }
+                    };
+                    enrich(&mut store, &runs, &settings, cancel, updates);
+                    let folder = store.export_report(&path, scope)?;
+                    updates.send(Event::Status(format!(
+                        "보고서 내보냄: {}",
+                        folder.display()
+                    )))?;
+                    let _ = crate::platform::open_external(&folder);
+                }
+                Command::OpenReport(run_id) => {
+                    enrich(
+                        &mut store,
+                        std::slice::from_ref(&run_id),
+                        &settings,
+                        cancel,
+                        updates,
+                    );
+                    let page = store.preview_report(&run_id)?;
+                    crate::platform::open_external(&page)?;
+                    updates.send(Event::Status("브라우저에서 보고서를 열었습니다".into()))?;
+                }
+                Command::Continue {
+                    run_id,
+                    rounds,
+                    direction,
+                } => {
+                    let provider = Subscriptions::new(&root, settings.clone());
+                    execution::resume(
+                        &mut store,
+                        &run_id,
+                        execution::ContinueInput::new(rounds, direction),
+                        &settings,
+                        &provider,
+                        cancel,
+                        &mut |p, status| {
+                            let _ = updates.send(Event::Progress(Box::new(p.clone()), status));
+                        },
+                    )?;
+                }
+                Command::Ask { run_id, question } => {
+                    let provider = Subscriptions::new(&root, settings.clone());
+                    execution::ask(
+                        &mut store,
+                        &run_id,
+                        &question,
+                        &settings,
+                        &provider,
+                        cancel,
+                        &mut |p, status| {
+                            let _ = updates.send(Event::Progress(Box::new(p.clone()), status));
+                        },
+                    )?;
+                }
+                Command::WriteReport(run_id) => {
+                    let provider = Subscriptions::new(&root, settings.clone());
+                    execution::write_report(
+                        &mut store,
+                        &run_id,
+                        &settings,
+                        &provider,
+                        cancel,
+                        &mut |p, status| {
+                            let _ = updates.send(Event::Progress(Box::new(p.clone()), status));
+                        },
+                    )?;
                 }
                 Command::ImportBundle(path) => {
                     store = Store::import_bundle(&root, &path)?;

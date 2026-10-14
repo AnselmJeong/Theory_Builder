@@ -1,7 +1,11 @@
 //! Pure research contracts and validation. No UI, database, or provider dependencies.
+pub mod bib;
 pub mod planning;
+pub mod report;
 pub mod research;
+pub use bib::*;
 pub use planning::*;
+pub use report::*;
 pub use research::*;
 
 pub fn id(prefix: &str) -> String {
