@@ -5,7 +5,7 @@
 //! pandoc keys (`[@key]`) that resolve to the exported BibTeX file.
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 /// How firm a point is, in words a reader can use.
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
@@ -295,6 +295,45 @@ impl Vocabulary {
         out
     }
 }
+/// Text for comparing figures: letters and digits only, lower case.
+fn plain_key(s: &str) -> String {
+    s.chars()
+        .filter(|c| c.is_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+/// Whether two figures show essentially the same thing.
+fn same_picture(a: &Figure, b: &Figure) -> bool {
+    if a.kind != b.kind {
+        return false;
+    }
+    let title = plain_key(&a.title);
+    if !title.is_empty() && title == plain_key(&b.title) {
+        return true;
+    }
+    let cells = |f: &Figure| -> HashSet<String> {
+        match f.kind {
+            FigureKind::Diagram => f.nodes.iter().map(|n| plain_key(&n.label)).collect(),
+            FigureKind::Table => f
+                .columns
+                .iter()
+                .chain(f.rows.iter().flatten())
+                .map(|c| plain_key(c))
+                .collect(),
+        }
+    };
+    let (x, y) = (cells(a), cells(b));
+    let x: HashSet<&String> = x.iter().filter(|c| !c.is_empty()).collect();
+    let y: HashSet<&String> = y.iter().filter(|c| !c.is_empty()).collect();
+    if x.len() < 2 || y.len() < 2 {
+        return false;
+    }
+    // At least 70% of all distinct boxes (or cells) shared.
+    x.intersection(&y).count() * 10 >= x.union(&y).count() * 7
+}
+fn richness(f: &Figure) -> usize {
+    f.nodes.len() + f.edges.len() + f.rows.len() * f.columns.len().max(1)
+}
 fn token_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || c == '_' || c == '-'
 }
@@ -523,17 +562,82 @@ impl ReaderReport {
                 before - self.figures.len()
             ));
         }
+        notes.extend(self.tidy_figures());
+        notes
+    }
+    /// Each figure once, and no figure twice in other clothes. A figure that repeats an
+    /// earlier one (same kind and mostly the same boxes or cells, or the same title) is
+    /// merged into it, keeping the fuller of the two; a figure listed by several key points
+    /// or sections stays only at its first place. Unknown references are dropped. Returns
+    /// what was changed. Safe to apply to reports stored before this rule existed.
+    pub fn tidy_figures(&mut self) -> Vec<String> {
+        let mut notes = vec![];
+        let mut alias: HashMap<String, String> = HashMap::new();
+        let mut i = 0;
+        while i < self.figures.len() {
+            let mut j = i + 1;
+            while j < self.figures.len() {
+                if !same_picture(&self.figures[i], &self.figures[j]) {
+                    j += 1;
+                    continue;
+                }
+                let dup = self.figures.remove(j);
+                let kept = self.figures[i].id.clone();
+                alias.insert(dup.id.clone(), kept.clone());
+                if richness(&dup) > richness(&self.figures[i]) {
+                    self.figures[i] = Figure { id: kept, ..dup };
+                }
+            }
+            i += 1;
+        }
+        if !alias.is_empty() {
+            notes.push(format!(
+                "같은 내용을 되풀이한 그림 {}개를 합침",
+                alias.len()
+            ));
+        }
         let figures: HashSet<String> = self.figures.iter().map(|f| f.id.clone()).collect();
+        let mut shown: HashSet<String> = HashSet::new();
+        let mut repeats = 0;
         for list in self
             .key_points
             .iter_mut()
             .map(|k| &mut k.figure_ids)
             .chain(self.sections.iter_mut().map(|s| &mut s.figure_ids))
         {
-            list.retain(|id| figures.contains(id));
-            list.dedup();
+            let mut kept = vec![];
+            for id in list.drain(..) {
+                let id = alias.get(&id).cloned().unwrap_or(id);
+                if !figures.contains(&id) {
+                    continue;
+                }
+                if shown.insert(id.clone()) {
+                    kept.push(id);
+                } else if !kept.contains(&id) {
+                    repeats += 1;
+                }
+            }
+            *list = kept;
+        }
+        if repeats > 0 {
+            notes.push(format!(
+                "여러 곳에 걸린 그림 {repeats}건은 처음 나오는 곳에만 둠"
+            ));
         }
         notes
+    }
+    /// Figures the key points refer to, in order. They are shown once, right after the key
+    /// points, so each point stays a short paragraph.
+    pub fn key_point_figures(&self) -> Vec<&Figure> {
+        let mut out: Vec<&Figure> = vec![];
+        for id in self.key_points.iter().flat_map(|k| &k.figure_ids) {
+            if let Some(f) = self.figures.iter().find(|f| f.id == *id)
+                && !out.iter().any(|o| o.id == f.id)
+            {
+                out.push(f);
+            }
+        }
+        out
     }
     /// Figures no key point or section shows; the reader still sees them, after the sections.
     pub fn unplaced_figures(&self) -> Vec<&Figure> {
@@ -675,5 +779,67 @@ mod tests {
         assert_eq!(r.figure_number("F2"), Some(1));
         assert_eq!(r.unplaced_figures().len(), 1);
         assert!(notes.iter().any(|n| n.contains("@nope")));
+    }
+    fn diagram(id: &str, title: &str, labels: &[&str]) -> Figure {
+        record::<Figure>(|f| {
+            f.id = id.into();
+            f.title = title.into();
+            f.nodes = labels
+                .iter()
+                .enumerate()
+                .map(|(i, l)| {
+                    record::<DiagramNode>(|n| {
+                        n.id = format!("n{i}");
+                        n.label = (*l).into();
+                    })
+                })
+                .collect();
+        })
+    }
+    #[test]
+    fn each_figure_is_shown_once() {
+        let mut r = record::<ReaderReport>(|r| {
+            for (body, ids) in [("하나", vec!["F1"]), ("둘", vec!["F1", "F3"])] {
+                r.key_points.push(record::<KeyPoint>(|k| {
+                    k.body = body.into();
+                    k.figure_ids = ids.into_iter().map(String::from).collect();
+                }));
+            }
+            r.sections.push(record::<Section>(|s| {
+                s.body = "설명".into();
+                s.figure_ids = vec!["F2".into(), "F1".into(), "F3".into()];
+            }));
+            // F2 repeats F1 with one box more; F3 shows something else.
+            r.figures = vec![
+                diagram(
+                    "F1",
+                    "세 수준",
+                    &["스트레스", "시냅스 가소성", "HPA축", "기분"],
+                ),
+                diagram(
+                    "F2",
+                    "수준 사이의 연결",
+                    &["스트레스", "시냅스 가소성", "HPA 축", "기분", "회복"],
+                ),
+                diagram("F3", "예측", &["약물", "수면", "반응"]),
+            ];
+        });
+        let notes = r.sanitize(&vocab());
+        assert_eq!(
+            r.figures.iter().map(|f| f.id.as_str()).collect::<Vec<_>>(),
+            ["F1", "F3"]
+        );
+        // The fuller drawing survives under the first figure's number.
+        assert_eq!(r.figures[0].nodes.len(), 5);
+        assert_eq!(r.figures[0].title, "수준 사이의 연결");
+        assert_eq!(r.key_points[0].figure_ids, ["F1"]);
+        assert_eq!(r.key_points[1].figure_ids, ["F3"]);
+        assert!(r.sections[0].figure_ids.is_empty());
+        assert_eq!(r.key_point_figures().len(), 2);
+        assert_eq!(r.figure_number("F3"), Some(2));
+        assert!(notes.iter().any(|n| n.contains("합침")));
+        assert!(notes.iter().any(|n| n.contains("처음 나오는 곳")));
+        // Applying it again changes nothing.
+        assert!(r.tidy_figures().is_empty());
     }
 }

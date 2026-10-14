@@ -121,10 +121,13 @@ pub fn reader_view(p: &Project, run: &Run) -> ReaderView {
     let all = References::new(p, &keys);
     match &run.reading {
         Some(r) => {
-            let cited = r.report.citations();
+            let mut report = r.report.clone();
+            // Reports stored before figures were de-duplicated may repeat a figure.
+            report.tidy_figures();
+            let cited = report.citations();
             ReaderView {
                 references: all.cited_in(&cited),
-                report: r.report.clone(),
+                report,
                 fallback: false,
             }
         }
@@ -186,6 +189,25 @@ pub fn how_made(run: &Run) -> String {
     );
     if let Some(stop) = d.stop {
         s.push_str(&format!(" 토론은 '{}'로 끝났습니다.", stop.label()));
+    }
+    // Runs made before the writer role were synthesised by the author.
+    let synthesis = if d.writer.is_empty() {
+        &d.author
+    } else {
+        &d.writer
+    };
+    let report = run.reading.as_ref().map_or("", |r| r.provider.as_str());
+    let name = |p: &str| ProviderKind::from_label(p).display();
+    if !report.is_empty() && (report == synthesis || synthesis.is_empty()) {
+        s.push_str(&format!(" 종합과 이 보고서는 {}가 썼습니다.", name(report)));
+    } else if !report.is_empty() {
+        s.push_str(&format!(
+            " 종합은 {}가, 이 보고서는 {}가 썼습니다.",
+            name(synthesis),
+            name(report)
+        ));
+    } else if !synthesis.is_empty() {
+        s.push_str(&format!(" 종합은 {}가 썼습니다.", name(synthesis)));
     }
     s.push_str(" 수치 시뮬레이션은 수행하지 않았고, 두 모델의 합의는 실험적 근거가 아닙니다.");
     s
@@ -404,10 +426,10 @@ pub fn run_markdown(
                 k.standing.explain(),
                 k.body.trim()
             ));
-            for id in &k.figure_ids {
-                s.push_str(&figure_block(id));
-                s.push('\n');
-            }
+        }
+        for f in r.key_point_figures() {
+            s.push_str(&figure_block(&f.id));
+            s.push('\n');
         }
     }
     if !r.sections.is_empty() {

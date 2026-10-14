@@ -134,6 +134,8 @@ struct RunExecutor<'a> {
     run_ix: usize,
     author: ProviderKind,
     critic: ProviderKind,
+    /// Writes the synthesis, the reader report and follow-up answers.
+    writer: ProviderKind,
     /// Set when the critic provider cannot be used any more in this run (login, quota).
     critic_down: Option<String>,
 }
@@ -147,6 +149,26 @@ impl RunExecutor<'_> {
     fn remaining(&self) -> u32 {
         let r = self.run();
         r.call_limit().saturating_sub(r.calls)
+    }
+    /// The model that writes the outcome. When the writer is the critic and the critic can no
+    /// longer be used in this run, the author writes instead, and the run says so.
+    fn writer_now(&mut self) -> ProviderKind {
+        if self.writer == self.critic
+            && self.critic != self.author
+            && let Some(reason) = self.critic_down.clone()
+        {
+            let note = format!(
+                "정리 모델({}) 사용 불가로 {}가 종합·보고서를 씀: {reason}",
+                self.writer.display(),
+                self.author.display()
+            );
+            let r = self.run_mut();
+            if !r.limitations.contains(&note) {
+                r.limitations.push(note);
+            }
+            return self.author;
+        }
+        self.writer
     }
     fn emit(&mut self, message: String) {
         (self.notify)(&self.store.project, message);
@@ -404,10 +426,15 @@ impl RunExecutor<'_> {
                         return Err(e);
                     }
                     self.critic_down = Some(message.clone());
-                    self.run_mut().limitations.push(format!(
-                        "비판 모델({}) 사용 불가로 토론을 멈춤: {message}",
-                        step.provider.display()
-                    ));
+                    let what = if step.phase == Phase::Synthesis {
+                        "정리 모델({}) 사용 불가로 종합을 쓰지 못함"
+                    } else {
+                        "비판 모델({}) 사용 불가로 토론을 멈춤"
+                    }
+                    .replace("{}", step.provider.display());
+                    self.run_mut()
+                        .limitations
+                        .push(format!("{what}: {message}"));
                 }
                 return Ok(None);
             }
@@ -764,17 +791,19 @@ impl RunExecutor<'_> {
         }
     }
     fn synthesize(&mut self, task: &TaskSpec) -> Result<()> {
+        let provider = self.writer_now();
         let step = Step {
             task_id: &task.id,
             role: Some(Role::Synthesizer),
             phase: Phase::Synthesis,
             round: self.run().deliberation.rounds,
-            provider: self.author,
+            provider,
             reserve: 1,
         };
         let context = synthesis_context(&self.store.project, self.run(), task);
         if let Some(output) = self.step(step, task, context)? {
             let r = self.run_mut();
+            r.deliberation.writer = provider.label().into();
             r.report = render_answer(&output);
             r.state = if output.evidence_insufficient {
                 RunState::EvidenceInsufficient
@@ -820,12 +849,13 @@ impl RunExecutor<'_> {
             .cloned()
             .collect();
         let context = reader::report_context(&self.store.project, self.run(), &keys, &bib_needed);
+        let writer = self.writer_now();
         let step = Step {
             task_id: "report",
             role: None,
             phase: Phase::Report,
             round: self.run().deliberation.rounds,
-            provider: self.author,
+            provider: writer,
             reserve: 0,
         };
         let raw = match self.call(step, context, schema::<ReaderReport>()) {
@@ -890,8 +920,8 @@ impl RunExecutor<'_> {
             notes.extend(report.sanitize(&vocabulary));
             Ok(report)
         })();
-        let model = self.settings.model(self.author).to_string();
-        let provider = self.author.label().to_string();
+        let model = self.settings.model(writer).to_string();
+        let provider = writer.label().to_string();
         let round = self.run().deliberation.rounds;
         let run = self.run_mut();
         let a = run.attempts.last_mut().unwrap();
@@ -1069,8 +1099,16 @@ impl RunExecutor<'_> {
         }
         if let Some(stop) = r.deliberation.stop {
             r.limitations.retain(|l| !l.starts_with("토론: "));
+            let writer = if r.deliberation.writer.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    " · 정리 {}",
+                    ProviderKind::from_label(&r.deliberation.writer).display()
+                )
+            };
             r.limitations.push(format!(
-                "토론: {} → {} · {}회 수정 · {}",
+                "토론: {} → {} · {}회 수정 · {}{writer}",
                 ProviderKind::from_label(&r.deliberation.author).display(),
                 ProviderKind::from_label(&r.deliberation.critic).display(),
                 r.deliberation.rounds,
@@ -1197,12 +1235,8 @@ pub fn run(
             .all(|id| store.project.entries.iter().any(|e| e.proposal.id == *id)),
         "질문 대상이 없습니다"
     );
-    let author = settings.primary;
-    let critic = if settings.cross_review {
-        author.other()
-    } else {
-        author
-    };
+    let author = settings.author();
+    let critic = settings.critic();
     let base_revision = store.project.revision;
     store.project.runs.push(record::<Run>(|r| {
         r.id = id("run");
@@ -1256,6 +1290,7 @@ pub fn run(
         run_ix,
         author,
         critic,
+        writer: settings.writer,
         critic_down: None,
     };
     let result = executor.execute();
@@ -1274,7 +1309,8 @@ impl ContinueInput {
         }
     }
 }
-/// An executor for further work on an existing run, with its original model pairing.
+/// An executor for further work on an existing run: the debate keeps its original author and
+/// critic; the outcome is written by the writer chosen now.
 fn executor_for<'a>(
     store: &'a mut Store,
     run_id: &str,
@@ -1296,7 +1332,7 @@ fn executor_for<'a>(
         "이 질문은 아직 실행 중입니다"
     );
     let author = if run.deliberation.author.is_empty() {
-        settings.primary
+        settings.author()
     } else {
         ProviderKind::from_label(&run.deliberation.author)
     };
@@ -1318,6 +1354,7 @@ fn executor_for<'a>(
         run_ix,
         author,
         critic,
+        writer: settings.writer,
         critic_down: None,
     })
 }
@@ -1376,7 +1413,8 @@ pub fn resume(
     executor.finalize(result, base_revision)
 }
 /// (Re)write the reader report for an existing run — for runs made before the scribe
-/// existed, or after a failed report.
+/// existed, after a failed report, or with another writer. A failed rewrite keeps the
+/// previous report and reports the failure.
 pub fn write_report(
     store: &mut Store,
     run_id: &str,
@@ -1393,7 +1431,12 @@ pub fn write_report(
         .retain(|l| !l.starts_with("읽기 쉬운 보고서"));
     executor.store.save("보고서 작성 요청")?;
     let result = executor.write_report();
-    if executor.run().reading.is_none() {
+    let written = executor
+        .run()
+        .attempts
+        .last()
+        .is_some_and(|a| a.phase == Some(Phase::Report) && a.state == TaskState::Succeeded);
+    if !written {
         let reason = executor
             .run()
             .limitations
@@ -1429,7 +1472,7 @@ pub fn ask(
         role: None,
         phase: Phase::Ask,
         round: executor.run().deliberation.rounds,
-        provider: executor.author,
+        provider: executor.writer,
         reserve: 0,
     };
     let result = executor
@@ -1448,7 +1491,7 @@ pub fn ask(
         })
         .collect();
     let vocabulary = reader::vocabulary(&executor.store.project, executor.run(), keys);
-    let provider_label = executor.author.label().to_string();
+    let provider_label = executor.writer.label().to_string();
     let mut notes = vec![];
     let run = executor.run_mut();
     let a = run

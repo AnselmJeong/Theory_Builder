@@ -343,11 +343,19 @@ fn author_and_critic_alternate_until_material_critiques_are_settled() {
             "Claude:review",
             "GPT:revise-r1",
             "Claude:review-r1",
-            "GPT:synthesis",
-            "GPT:reader_report"
+            // The writer (Claude unless chosen otherwise) writes the outcome.
+            "Claude:synthesis",
+            "Claude:reader_report"
         ]
     );
     assert_eq!(run.state, RunState::Answered);
+    assert_eq!(run.deliberation.writer, "Claude");
+    assert_eq!(run.reading.as_ref().unwrap().provider, "Claude");
+    assert!(
+        run.limitations
+            .iter()
+            .any(|l| l.starts_with("토론: GPT → Claude") && l.ends_with("정리 Claude"))
+    );
     assert_eq!(run.deliberation.rounds, 1);
     assert_eq!(run.deliberation.stop, Some(StopReason::Converged));
     assert!(run.deliberation.cross_model());
@@ -460,8 +468,8 @@ fn continuing_a_converged_debate_follows_the_user_direction() {
             "Claude:review-r2",
             "GPT:revise-r2",
             "Claude:review-r2",
-            "GPT:synthesis",
-            "GPT:reader_report"
+            "Claude:synthesis",
+            "Claude:reader_report"
         ]
     );
     assert_eq!(run.state, RunState::Answered);
@@ -554,6 +562,8 @@ fn follow_up_answers_are_cleaned_and_can_suggest_more_debate() {
     let f = &run.followups[0];
     assert_eq!(f.answer, "Because 비판 1 was narrowed.");
     assert!(f.needs_research && f.error.is_none());
+    assert_eq!(f.provider, "Claude");
+    assert_eq!(provider.log().last().unwrap().0, ProviderKind::Claude);
     assert_eq!(run.attempts.last().unwrap().phase, Some(Phase::Ask));
     assert_eq!(run.state, RunState::Answered);
 }
@@ -592,6 +602,70 @@ fn a_broken_report_keeps_the_answer_and_can_be_rewritten() {
     );
 }
 
+#[test]
+fn the_writer_is_chosen_separately_and_can_rewrite_a_report() {
+    let (_dir, mut store) = setup();
+    let provider = Debate::new(Mode::Converge);
+    let mut settings = cross();
+    settings.writer = ProviderKind::Codex;
+    run(
+        &mut store,
+        RunInput::new("Does the change cause the transition?", Budget::Standard),
+        &settings,
+        &provider,
+        &Arc::new(AtomicBool::new(false)),
+        &mut |_, _| {},
+    )
+    .unwrap();
+    let log = provider.log();
+    assert!(log.ends_with(&[
+        (ProviderKind::Codex, "synthesis".into()),
+        (ProviderKind::Codex, "reader_report".into())
+    ]));
+    // The same debate, rewritten for the reader by the other model.
+    let id = store.project.runs[0].id.clone();
+    settings.writer = ProviderKind::Claude;
+    write_report(
+        &mut store,
+        &id,
+        &settings,
+        &provider,
+        &Arc::new(AtomicBool::new(false)),
+        &mut |_, _| {},
+    )
+    .unwrap();
+    let run = &store.project.runs[0];
+    assert_eq!(
+        provider.log().last().unwrap(),
+        &(ProviderKind::Claude, "reader_report".into())
+    );
+    assert_eq!(run.reading.as_ref().unwrap().provider, "Claude");
+    assert_eq!(run.deliberation.writer, "Codex");
+    assert!(theory_engine::report::how_made(run).contains("종합은 GPT가, 이 보고서는 Claude가"));
+}
+#[test]
+fn settings_saved_before_the_writer_role_give_the_write_up_to_claude() {
+    let old = r#"{"primary":"codex","cross_review":true,"codex_model":"","claude_model":"","codex_path":"","claude_path":"","dark":false,"zoom":0,"selected_project":""}"#;
+    let mut s: Settings = serde_json::from_str(old).unwrap();
+    assert_eq!(
+        (s.author(), s.critic(), s.writer),
+        (
+            ProviderKind::Codex,
+            ProviderKind::Claude,
+            ProviderKind::Claude
+        )
+    );
+    assert_eq!(s.roles(), [ProviderKind::Codex, ProviderKind::Claude]);
+    // Changing the author keeps the chosen critic, which may make it a same-model critique.
+    s.set_author(ProviderKind::Claude);
+    assert_eq!(
+        (s.author(), s.critic()),
+        (ProviderKind::Claude, ProviderKind::Claude)
+    );
+    assert!(!s.cross_review);
+    s.set_critic(ProviderKind::Codex);
+    assert!(s.cross_review);
+}
 #[test]
 fn persistent_dissent_stops_and_is_preserved_not_resolved() {
     let (_dir, mut store) = setup();
@@ -659,6 +733,17 @@ fn unavailable_critic_stops_debate_without_silent_fallback() {
     assert_eq!(run.state, RunState::Partial);
     assert!(run.limitations.iter().any(|l| l.contains("비판 모델")));
     assert!(!run.report.is_empty());
+    // Claude was also the writer: the author writes the outcome instead, and says so.
+    assert!(log.ends_with(&[
+        (ProviderKind::Codex, "synthesis".into()),
+        (ProviderKind::Codex, "reader_report".into())
+    ]));
+    assert_eq!(run.deliberation.writer, "Codex");
+    assert!(
+        run.limitations
+            .iter()
+            .any(|l| l.starts_with("정리 모델(Claude) 사용 불가로 GPT가"))
+    );
 }
 
 #[test]

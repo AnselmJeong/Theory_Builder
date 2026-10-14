@@ -22,6 +22,13 @@ impl Workspace {
     fn run_header(&self, run: &Run, cx: &mut Context<Self>) -> impl IntoElement {
         let d = &run.deliberation;
         let elapsed = run.finished.unwrap_or_else(now).saturating_sub(run.started);
+        // Who wrote what the reader sees: the report's writer, else the synthesis writer.
+        let writer = run
+            .reading
+            .as_ref()
+            .map(|r| r.provider.clone())
+            .filter(|p| !p.is_empty())
+            .or_else(|| Some(d.writer.clone()).filter(|p| !p.is_empty()));
         let mut meta = h_flex()
             .flex_wrap()
             .gap_2()
@@ -44,7 +51,12 @@ impl Workspace {
                         .child(dot(provider_color(&d.critic, cx)))
                         .child(format!("{} 비판", who(&d.critic)))
                     })
-                    .when(!d.cross_model(), |v| v.child("· 같은 모델 별도 문맥 비판")),
+                    .when(!d.cross_model(), |v| v.child("· 같은 모델 별도 문맥 비판"))
+                    .when_some(writer, |v, writer| {
+                        v.child(div().text_color(cx.theme().muted_foreground).child("·"))
+                            .child(dot(provider_color(&writer, cx)))
+                            .child(format!("{} 정리", who(&writer)))
+                    }),
             );
         }
         if d.rounds > 0 || d.stop.is_some() {

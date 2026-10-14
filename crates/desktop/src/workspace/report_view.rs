@@ -263,6 +263,40 @@ impl Workspace {
                     ),
             );
         }
+        // Who wrote this report, and a way to have the chosen writer write it again.
+        if let Some(reading) = run
+            .reading
+            .as_ref()
+            .filter(|_| run.state != RunState::Running)
+        {
+            let writer = self.settings.writer;
+            let id = run.id.clone();
+            body = body.child(
+                h_flex()
+                    .gap_2()
+                    .items_center()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(format!("{}가 정리한 보고서", who(&reading.provider))),
+                    )
+                    .child(
+                        Button::new("rewrite-report")
+                            .ghost()
+                            .xsmall()
+                            .icon(Icon::new(Lucide::RefreshCw))
+                            .label(format!("{}로 다시 쓰기 · 호출 1회", writer.display()))
+                            .tooltip("설정의 정리 모델과 지금의 작성 규칙으로 보고서를 다시 씁니다. 토론과 이어서 묻기 기록은 그대로 둡니다.")
+                            .disabled(self.busy())
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.submit(Command::WriteReport(id.clone()), cx)
+                            })),
+                    ),
+            );
+        }
         // The direct answer.
         let accent = accent(cx);
         body = body.child(
@@ -291,7 +325,7 @@ impl Workspace {
             body = body.child(heading("핵심 내용", cx));
             let mut points = v_flex().gap_3();
             for (i, k) in r.key_points.iter().enumerate() {
-                let mut item = card(cx).child(
+                let item = card(cx).child(
                     h_flex()
                         .gap_3()
                         .items_start()
@@ -328,12 +362,12 @@ impl Workspace {
                                 ))),
                         ),
                 );
-                for id in &k.figure_ids {
-                    item = item.child(self.figure_view(run, &view, id, cx));
-                }
                 points = points.child(item);
             }
             body = body.child(points);
+            for f in r.key_point_figures() {
+                body = body.child(self.figure_view(run, &view, &f.id, cx));
+            }
         }
         if !r.sections.is_empty() {
             body = body.child(heading("자세한 설명", cx));

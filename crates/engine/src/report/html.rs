@@ -144,12 +144,13 @@ fn article(q: usize, run: &Run, view: &ReaderView) -> String {
                 escape(k.heading.trim()),
                 md(&k.body, view)
             ));
-            for id in &k.figure_ids {
-                s.push_str(&figure(id));
-            }
             s.push_str("</li>\n");
         }
-        s.push_str("</ol></section>\n");
+        s.push_str("</ol>");
+        for f in r.key_point_figures() {
+            s.push_str(&figure(&f.id));
+        }
+        s.push_str("</section>\n");
     }
     if !r.sections.is_empty() {
         s.push_str(&format!(

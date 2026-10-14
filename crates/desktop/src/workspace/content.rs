@@ -35,12 +35,9 @@ impl Workspace {
             .into_any_element()
     }
     fn landing(&self, cx: &mut Context<Self>) -> AnyElement {
-        let author = self.settings.primary;
-        let critic = if self.settings.cross_review {
-            author.other()
-        } else {
-            author
-        };
+        let author = self.settings.author();
+        let critic = self.settings.critic();
+        let writer = self.settings.writer;
         let step = |n: &str, title: String, text: &str, color: Hsla, cx: &App| {
             v_flex()
                 .flex_1()
@@ -78,6 +75,7 @@ impl Workspace {
         };
         let a = provider_color(author.label(), cx);
         let k = provider_color(critic.label(), cx);
+        let w = provider_color(writer.label(), cx);
         let mut body = v_flex()
             .gap_6()
             .pt_8()
@@ -123,9 +121,9 @@ impl Workspace {
                     ))
                     .child(step(
                         "4",
-                        "종합".into(),
-                        "결론, 근거, 남은 이견, 다음 확인 사항을 정리합니다.",
-                        cx.theme().muted_foreground,
+                        format!("{} 정리", writer.display()),
+                        "결론·근거·남은 이견을 종합하고, 그림과 용어 풀이가 있는 읽기 쉬운 보고서를 씁니다.",
+                        w,
                         cx,
                     )),
             );
@@ -194,7 +192,9 @@ impl Workspace {
                 .child(section_title("예시 질문", cx))
                 .child(examples),
         );
-        let disconnected: Vec<&str> = [author, critic]
+        let disconnected: Vec<&str> = self
+            .settings
+            .roles()
             .iter()
             .filter(|p| !self.connection(**p).is_some_and(|c| c.authenticated))
             .map(|p| p.display())

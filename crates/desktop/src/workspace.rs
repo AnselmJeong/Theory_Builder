@@ -938,15 +938,20 @@ impl Workspace {
                 })),
             );
         }
-        let author = self.settings.primary;
-        let pairing = if self.settings.cross_review {
+        let (author, critic) = (self.settings.author(), self.settings.critic());
+        let pairing = if author != critic {
             format!(
-                "{} 구성 · {} 비판",
+                "{} 구성 · {} 비판 · {} 정리",
                 author.display(),
-                author.other().display()
+                critic.display(),
+                self.settings.writer.display()
             )
         } else {
-            format!("{} 단독", author.display())
+            format!(
+                "{} 단독 · {} 정리",
+                author.display(),
+                self.settings.writer.display()
+            )
         };
         let targets = self.snapshot.as_ref().map(|s| {
             self.targets
@@ -1014,9 +1019,9 @@ impl Workspace {
                                 .icon(Icon::new(Lucide::ArrowLeftRight))
                                 .label(pairing)
                                 .tooltip(if self.settings.cross_review {
-                                    "클릭하면 구성과 비판 모델을 서로 바꿉니다"
+                                    "클릭하면 구성과 비판 모델을 서로 바꿉니다 · 단계별 모델은 설정에서"
                                 } else {
-                                    "클릭하면 다른 모델로 바꿉니다 · 교차 비판은 설정에서"
+                                    "클릭하면 다른 모델로 바꿉니다 · 단계별 모델은 설정에서"
                                 })
                                 .disabled(busy)
                                 .on_click(cx.listener(|this, _, _, cx| {

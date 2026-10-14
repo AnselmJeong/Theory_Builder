@@ -1,5 +1,19 @@
 use super::*;
-use gpui_kit::component::radio::RadioGroup;
+/// The stages a user assigns a model to: (name, what it does).
+const STAGES: [(&str, &str); 3] = [
+    (
+        "구성",
+        "계획과 초안을 쓰고, 비판에 응답하며 이론을 고칩니다.",
+    ),
+    (
+        "비판",
+        "비판을 제기하고 해소 여부를 판정합니다. 구성과 같은 모델이면 별도 문맥에서 비판합니다.",
+    ),
+    (
+        "정리",
+        "토론이 끝나면 종합 답변, 읽기 쉬운 보고서, 이어서 묻기 답변을 씁니다.",
+    ),
+];
 impl Workspace {
     pub(super) fn open_settings(&mut self, cx: &mut Context<Self>) {
         self.page = Page::Settings;
@@ -51,15 +65,79 @@ impl Workspace {
     }
     pub(super) fn settings_view(&self, cx: &mut Context<Self>) -> AnyElement {
         let busy = self.busy();
-        let pairings = [
-            (ProviderKind::Claude, true, "Claude 구성 · GPT 비판"),
-            (ProviderKind::Codex, true, "GPT 구성 · Claude 비판"),
-            (ProviderKind::Claude, false, "Claude 단독 · 별도 문맥 비판"),
-            (ProviderKind::Codex, false, "GPT 단독 · 별도 문맥 비판"),
+        let mut stages = v_flex().gap_2();
+        let current = [
+            self.settings.author(),
+            self.settings.critic(),
+            self.settings.writer,
         ];
-        let selected = pairings
-            .iter()
-            .position(|(p, x, _)| *p == self.settings.primary && *x == self.settings.cross_review);
+        for (ix, ((name, what), chosen)) in STAGES.iter().zip(current).enumerate() {
+            let mut toggle = h_flex()
+                .flex_none()
+                .gap_0p5()
+                .p_0p5()
+                .rounded(cx.theme().radius)
+                .bg(cx.theme().muted);
+            for p in [ProviderKind::Claude, ProviderKind::Codex] {
+                toggle = toggle.child(
+                    Button::new(SharedString::from(format!("stage-{ix}-{}", p.label())))
+                        .ghost()
+                        .xsmall()
+                        .selected(chosen == p)
+                        .label(p.display())
+                        .disabled(busy)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            if this.busy() {
+                                return;
+                            }
+                            match ix {
+                                0 => this.settings.set_author(p),
+                                1 => this.settings.set_critic(p),
+                                _ => this.settings.writer = p,
+                            }
+                            this.save_settings(cx);
+                            cx.notify();
+                        })),
+                );
+            }
+            stages = stages.child(
+                h_flex()
+                    .gap_3()
+                    .items_center()
+                    .child(
+                        div()
+                            .flex_none()
+                            .w(rems(2.5))
+                            .text_sm()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(*name),
+                    )
+                    .child(toggle)
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(*what),
+                    ),
+            );
+        }
+        let [author, critic, writer] = current;
+        let summary = if author == critic {
+            format!(
+                "{}가 세우고 같은 모델의 별도 문맥이 비판합니다(독립적인 검증이 아님). 정리는 {}가 합니다.",
+                author.display(),
+                writer.display()
+            )
+        } else {
+            format!(
+                "{}가 세우고 {}가 비판합니다. 정리는 {}가 합니다.",
+                author.display(),
+                critic.display(),
+                writer.display()
+            )
+        };
         let mut body = v_flex()
             .gap_5()
             .child(page_header(
@@ -72,22 +150,15 @@ impl Workspace {
                     .gap_3()
                     .child(div().font_weight(FontWeight::SEMIBOLD).child("토론 구성"))
                     .child(muted(
-                        "구성 모델이 계획·초안·수정·종합을 맡고, 비판 모델이 비판과 판정을 맡습니다. 비판의 해소 여부는 비판 모델만 판정합니다. 두 모델의 합의는 경험적 근거가 아닙니다.",
+                        "단계마다 맡을 모델을 고릅니다. 비판의 해소 여부는 비판 모델만 판정하고, 두 모델의 합의는 경험적 근거가 아닙니다. 이미 실행한 질문의 토론을 이어 가면 구성·비판은 그 질문의 원래 모델을 따르고, 종합과 보고서는 지금 고른 정리 모델이 씁니다.",
                         cx,
                     ))
+                    .child(stages)
                     .child(
-                        RadioGroup::new("pairing")
-                            .children(pairings.iter().map(|(_, _, l)| *l))
-                            .selected_index(selected)
-                            .on_change(cx.listener(move |this, ix: &usize, _, cx| {
-                                if this.busy() {
-                                    return;
-                                }
-                                let (p, x, _) = pairings[*ix];
-                                this.settings.primary = p;
-                                this.settings.cross_review = x;
-                                this.save_settings(cx);
-                            })),
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(summary),
                     ),
             )
             .child(div().pt_2().font_weight(FontWeight::SEMIBOLD).child("모델 연결"));
