@@ -9,6 +9,13 @@ theory-engine = { path = "../engine" }
 gpui-kit = "=0.7.1"
 anyhow.workspace = true
 serde_json.workspace = true
+# Decodes the embedded icon for the X11 window icon.
+image = { version = "0.25", default-features = false, features = ["png"] }
+# Sets the Dock icon at launch, so an unbundled run (cargo run) has it too.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSApplication", "NSImage", "NSResponder"] }
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSData"] }
 [dev-dependencies]
 gpui-kit = { version = "=0.7.1", features = ["test-support"] }
 tempfile.workspace = true

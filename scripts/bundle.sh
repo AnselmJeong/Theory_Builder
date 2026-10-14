@@ -78,4 +78,10 @@ mv "$staging" "$installed"
 built_sum="$(shasum -a 256 "$app/Contents/MacOS/theory-studio" | cut -d' ' -f1)"
 installed_sum="$(shasum -a 256 "$installed/Contents/MacOS/theory-studio" | cut -d' ' -f1)"
 [ "$built_sum" = "$installed_sum" ] || { echo 'Installed binary differs from the build.' >&2; exit 1; }
+# Finder and the Dock cache icons per bundle; re-register so the new icon shows.
+touch "$installed"
+lsregister=/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister
+if [ -x "$lsregister" ]; then
+  "$lsregister" -f "$installed" >/dev/null 2>&1 || true
+fi
 printf 'Installed Theory Studio %s (%s) at %s\n' "$version" "$build" "$installed"

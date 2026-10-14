@@ -40,7 +40,7 @@ cargo run --locked -p theory-studio
 
 Rust 1.99.0은 `rust-toolchain.toml`로 고정합니다. UI는 `gpui-kit = 0.7.1`이며 전이 의존성은 `Cargo.lock`에 고정되어 있습니다. 별도 웹 서버·Python worker·LLM API 키가 필요하지 않습니다.
 
-- **macOS (주 대상)**: `scripts/bundle.sh release` 후 `open 'dist/Theory Studio.app'`. 설치본을 새 판으로 바꾸려면 `scripts/bundle.sh release install` — 실행 중인 앱을 종료하고 `~/Applications/Theory Studio.app`(또는 `THEORY_STUDIO_INSTALL_DIR`)을 교체합니다. 프로젝트·설정은 앱 밖에 있어 그대로 남습니다. 버전은 `Cargo.toml`에서 읽습니다. 로컬 bundle은 ad-hoc 서명이며 공증된 배포판이 아닙니다. PDF는 번들된 PDFKit 도우미로 읽습니다.
+- **macOS (주 대상)**: `scripts/bundle.sh release` 후 `open 'dist/Theory Studio.app'`. 설치본을 새 판으로 바꾸려면 `scripts/bundle.sh release install` — 실행 중인 앱을 종료하고 `~/Applications/Theory Studio.app`(또는 `THEORY_STUDIO_INSTALL_DIR`)을 교체합니다. 프로젝트·설정은 앱 밖에 있어 그대로 남습니다. 버전은 `Cargo.toml`에서 읽습니다. 앱 아이콘은 `python3 scripts/make_icon.py`(Pillow)가 `resources/icons/`에 만들며, 번들 없이 실행해도 Dock(macOS)·창(Linux) 아이콘으로 쓰입니다. 교체 후에도 Dock에 옛 아이콘이 보이면 `killall Dock`으로 Dock을 다시 띄우세요. 로컬 bundle은 ad-hoc 서명이며 공증된 배포판이 아닙니다. PDF는 번들된 PDFKit 도우미로 읽습니다.
 - **Linux**: 빌드·실행됩니다. `libxkbcommon-dev`, `libxkbcommon-x11-dev`, Vulkan 또는 Mesa GL이 필요하고, PDF 본문은 poppler의 `pdftotext`로 읽습니다. 데이터는 `$XDG_DATA_HOME/theory-studio`에 저장합니다.
 
 Codex와 Claude CLI는 앱에 포함하지 않고 설치된 공식 CLI를 탐지합니다(`~/.local/bin`, `/opt/homebrew/bin`, `/usr/local/bin`, PATH). 설정에서 경로를 지정할 수 있습니다. TinyFish 검색은 ScholarPen에 저장된 API 연결을 재사용하며, 없으면 PubMed만 사용합니다.
