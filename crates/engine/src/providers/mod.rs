@@ -47,11 +47,18 @@ impl ProviderKind {
         }
     }
 }
+/// Who does what in a debate. `primary` builds the theory (plan, draft, answers and
+/// revisions); the critic is the other model when `cross_review`, else the same model in a
+/// separate context; `writer` writes the final synthesis, the reader report and follow-up
+/// answers.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct Settings {
     pub primary: ProviderKind,
     pub cross_review: bool,
+    /// Settings saved before the writer role existed get Claude.
+    #[serde(default = "writer_default")]
+    pub writer: ProviderKind,
     pub codex_model: String,
     pub claude_model: String,
     pub codex_path: String,
@@ -67,11 +74,15 @@ pub struct Settings {
 fn search_default() -> bool {
     true
 }
+fn writer_default() -> ProviderKind {
+    ProviderKind::Claude
+}
 impl Default for Settings {
     fn default() -> Self {
         Self {
             primary: ProviderKind::Codex,
             cross_review: false,
+            writer: writer_default(),
             codex_model: String::new(),
             claude_model: String::new(),
             codex_path: String::new(),
@@ -85,6 +96,35 @@ impl Default for Settings {
     }
 }
 impl Settings {
+    pub fn author(&self) -> ProviderKind {
+        self.primary
+    }
+    pub fn critic(&self) -> ProviderKind {
+        if self.cross_review {
+            self.primary.other()
+        } else {
+            self.primary
+        }
+    }
+    pub fn set_critic(&mut self, critic: ProviderKind) {
+        self.cross_review = critic != self.primary;
+    }
+    /// Change the author and keep the chosen critic.
+    pub fn set_author(&mut self, author: ProviderKind) {
+        let critic = self.critic();
+        self.primary = author;
+        self.set_critic(critic);
+    }
+    /// Every model a new question uses, without repeats.
+    pub fn roles(&self) -> Vec<ProviderKind> {
+        let mut out = vec![self.author()];
+        for p in [self.critic(), self.writer] {
+            if !out.contains(&p) {
+                out.push(p);
+            }
+        }
+        out
+    }
     pub fn model(&self, p: ProviderKind) -> &str {
         match p {
             ProviderKind::Codex => &self.codex_model,

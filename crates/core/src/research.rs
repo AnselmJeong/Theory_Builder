@@ -599,6 +599,9 @@ impl StopReason {
 pub struct Deliberation {
     pub author: String,
     pub critic: String,
+    /// Who wrote the latest synthesis (empty for runs made before the writer role).
+    #[serde(default)]
+    pub writer: String,
     pub max_rounds: u32,
     pub rounds: u32,
     pub stop: Option<StopReason>,
