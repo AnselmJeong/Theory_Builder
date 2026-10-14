@@ -31,7 +31,9 @@ fn settle(
     view: &Entity<Workspace>,
     done: impl Fn(&Workspace) -> bool,
 ) {
-    for _ in 0..80 {
+    // Up to 10 s for the service thread (SQLite with full sync) under a parallel test run;
+    // returns as soon as `done` holds.
+    for _ in 0..1000 {
         std::thread::sleep(std::time::Duration::from_millis(10));
         cx.update_window(window.into(), |_, w, cx| {
             view.update(cx, |v, cx| v.poll(w, cx))
