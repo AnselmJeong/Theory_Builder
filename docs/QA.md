@@ -13,7 +13,7 @@ Xvfb + Mesa(Noto CJK 글꼴)에서 `demo_project` 데이터(스크립트 응답)
 ## 미검증
 
 - 실제 Claude·Codex 구독으로 서기 보고서·이어 가기·후속 질문을 실행하지 않았다(이 환경에 로그인 없음). 보고서 품질은 실제 질문으로 확인해야 한다.
-- PubMed efetch·Crossref 서지 보완의 실제 네트워크 호출(파서만 검증).
+- PubMed efetch·Crossref·doi.org 서지 보완의 실제 네트워크 호출(파서, 제목 일치 판정, 주소의 DOI 추출, 레코드 병합만 검증).
 - macOS 빌드·번들.
 
 ---

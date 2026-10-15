@@ -1,35 +1,50 @@
 //! Bibliographic records for the sources a report cites, their pandoc/BibTeX keys and
-//! the reference lines readers see. Metadata comes from PubMed, Crossref, the source's own
-//! printed header (checked letter by letter) or, at worst, its file name — never a guess.
+//! the reference lines readers see. Metadata comes from PubMed, Crossref/DataCite (by a
+//! DOI the source carries, or a title search whose hit must carry the same title), the
+//! source's own printed header (checked letter by letter) or, at worst, its file name —
+//! never a guess.
 use crate::{Access, Source};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
 #[non_exhaustive]
 pub struct BibInfo {
     /// Citation key. Empty until a report cites the source; then frozen so that stored
     /// report text and exported BibTeX keep agreeing.
-    #[serde(default)]
     pub key: String,
-    /// article | book | misc | online
+    /// article | book | incollection | inproceedings | misc | online
     pub entry_type: String,
     pub title: String,
     /// "Family, Given" or a collective name.
     pub authors: Vec<String>,
+    /// Book editors (chapters), "Family, Given".
+    pub editors: Vec<String>,
     pub year: String,
-    /// Journal or book title.
+    /// 1–12, empty when unknown.
+    pub month: String,
+    /// Journal, book or proceedings title.
     pub container: String,
+    /// Book series (e.g. Lecture Notes in Computer Science).
+    pub series: String,
     pub volume: String,
     pub number: String,
+    /// Page range or article number.
     pub pages: String,
     pub publisher: String,
+    pub isbn: String,
+    pub issn: String,
     pub doi: String,
     pub pmid: String,
     pub url: String,
+    /// When a web page was read (YYYY-MM-DD).
+    pub urldate: String,
     pub note: String,
-    /// pubmed | crossref | source-text | file | web
+    /// pubmed | crossref | doi.org | source-text | file | web
     pub origin: String,
+    /// The full record has been looked up (found or not); it is not asked for again.
+    pub looked_up: bool,
 }
 const STOPWORDS: [&str; 23] = [
     "the", "a", "an", "of", "on", "in", "and", "for", "to", "with", "from", "toward", "towards",
@@ -189,6 +204,156 @@ pub fn find_doi(text: &str) -> Option<String> {
     }
     None
 }
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%'
+            && let Some(v) = s
+                .get(i + 1..i + 3)
+                .and_then(|h| u8::from_str_radix(h, 16).ok())
+        {
+            out.push(v);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+/// Page selectors publishers append to a DOI in an article address.
+const DOI_URL_SUFFIXES: [&str; 19] = [
+    "/full",
+    "/abstract",
+    "/pdf",
+    "/epdf",
+    "/pdfdirect",
+    "/epub",
+    "/fulltext",
+    "/full-text",
+    "/html",
+    "/meta",
+    "/summary",
+    "/references",
+    "/figures",
+    "/tables",
+    "/metrics",
+    "/info",
+    ".full",
+    ".abstract",
+    ".pdf",
+];
+/// The DOI an article's own address names: a DOI in the path or query (doi.org, Frontiers,
+/// PLOS, Springer, Wiley, Science, PNAS, bioRxiv…), nature.com/articles/<id>, or an arXiv
+/// abstract. Page selectors (/full, /pdf, .full…) and preprint versions are dropped.
+pub fn doi_in_url(url: &str) -> Option<String> {
+    let url = percent_decode(url.trim());
+    let rest = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))?;
+    let (host, path) = rest.split_once('/').unwrap_or((rest, ""));
+    let host = host.to_lowercase();
+    let host = host.strip_prefix("www.").unwrap_or(&host);
+    // The identifier after `prefix`, up to the query; `/` ends it unless `slashes`.
+    let segment = |prefix: &str, slashes: bool| {
+        path.strip_prefix(prefix).and_then(|p| {
+            let id = p
+                .split(|c| c == '?' || c == '#' || (c == '/' && !slashes))
+                .next()
+                .unwrap_or_default();
+            let id = id.strip_suffix(".pdf").unwrap_or(id);
+            (!id.is_empty()).then(|| id.to_string())
+        })
+    };
+    if (host == "nature.com" || host.ends_with(".nature.com"))
+        && let Some(id) = segment("articles/", false)
+    {
+        return Some(format!("10.1038/{id}"));
+    }
+    if host == "arxiv.org" || host == "export.arxiv.org" {
+        // Old-style identifiers keep their archive: math/0211159.
+        let id = segment("abs/", true).or_else(|| segment("pdf/", true))?;
+        let id = match id.rsplit_once('v') {
+            Some((base, v)) if !v.is_empty() && v.bytes().all(|c| c.is_ascii_digit()) => base,
+            _ => id.as_str(),
+        };
+        return Some(format!("10.48550/arXiv.{id}"));
+    }
+    let found = find_doi(&url)?;
+    let mut doi = found
+        .split(['?', '&', '#'])
+        .next()
+        .unwrap_or_default()
+        .trim_end_matches('/')
+        .to_string();
+    loop {
+        let lower = doi.to_lowercase();
+        let Some(cut) = DOI_URL_SUFFIXES
+            .iter()
+            .find(|s| lower.ends_with(**s) && lower.len() > s.len())
+            .map(|s| doi.len() - s.len())
+        else {
+            break;
+        };
+        doi.truncate(cut);
+        doi = doi.trim_end_matches('/').to_string();
+    }
+    // bioRxiv/medRxiv addresses carry a version the DOI does not.
+    if doi.starts_with("10.1101/")
+        && let Some((base, v)) = doi.rsplit_once('v')
+        && !v.is_empty()
+        && v.bytes().all(|c| c.is_ascii_digit())
+        && base.ends_with(|c: char| c.is_ascii_digit())
+    {
+        doi = base.to_string();
+    }
+    (doi.len() > 8 && doi.contains('/')).then_some(doi)
+}
+/// Whether a looked-up record's title is the source's title: the same letters, or one
+/// inside the other with little to spare (a site name after the title, a subtitle).
+pub fn same_title(a: &str, b: &str) -> bool {
+    let (a, b) = (normalized(a), normalized(b));
+    let (short, long) = if a.len() <= b.len() { (a, b) } else { (b, a) };
+    if short.chars().count() < 12 {
+        return false;
+    }
+    short == long
+        || (short.chars().count() >= 20
+            && long.contains(&short)
+            && short.len() * 10 >= long.len() * 6)
+}
+/// Whether two author names share a family name, with or without diacritics.
+pub fn same_family(a: &str, b: &str) -> bool {
+    let family = |n: &str| words(&BibInfo::family(n)).concat();
+    let (a, b) = (family(a), family(b));
+    !a.is_empty() && a == b
+}
+/// "201-9" → ("201", "209"); "S44–S50" → ("S44", "S50"); a single page or article
+/// number → None.
+fn page_range(pages: &str) -> Option<(String, String)> {
+    let p = pages.trim();
+    if p.contains(',') {
+        return None;
+    }
+    let (a, b) = p
+        .split_once("--")
+        .or_else(|| p.split_once(['-', '–', '—', '‐', '‑']))?;
+    let (a, b) = (a.trim(), b.trim().trim_start_matches('-'));
+    if a.is_empty() || b.is_empty() {
+        return None;
+    }
+    let digits = |s: &str| s.bytes().all(|c| c.is_ascii_digit());
+    // MEDLINE abbreviates the last page: 201-9 is 201–209.
+    if digits(a) && digits(b) && b.len() < a.len() {
+        return Some((a.into(), format!("{}{b}", &a[..a.len() - b.len()])));
+    }
+    Some((a.into(), b.into()))
+}
+const MONTHS: [&str; 12] = [
+    "jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec",
+];
 impl BibInfo {
     pub fn family(author: &str) -> String {
         if let Some((family, _)) = author.split_once(',') {
@@ -329,7 +494,10 @@ impl BibInfo {
                 }
             }
             if !self.pages.is_empty() {
-                s.push_str(&format!(", {}", self.pages));
+                match page_range(&self.pages) {
+                    Some((a, b)) => s.push_str(&format!(", {a}–{b}")),
+                    None => s.push_str(&format!(", {}", self.pages)),
+                }
             }
             s.push('.');
         } else if !self.publisher.is_empty() {
@@ -354,6 +522,8 @@ impl BibInfo {
             None
         }
     }
+    /// A full BibTeX entry: every field the record has, in a fixed order, page ranges with
+    /// `--`, the month as a macro and a DOI link as the url when no other address is known.
     pub fn bibtex(&self, key: &str) -> String {
         let kind = match self.entry_type.as_str() {
             "article" | "book" | "online" | "misc" | "incollection" | "inproceedings" => {
@@ -361,37 +531,69 @@ impl BibInfo {
             }
             _ => "misc",
         };
-        let mut fields: Vec<(&str, String)> = vec![];
-        if !self.authors.is_empty() {
-            fields.push(("author", self.authors.join(" and ")));
-        }
-        fields.push(("title", self.title.clone()));
         let container = match kind {
             "article" => "journal",
             "incollection" | "inproceedings" => "booktitle",
             _ => "howpublished",
         };
+        let pages = match page_range(&self.pages) {
+            Some((a, b)) => format!("{a}--{b}"),
+            None => self.pages.trim().to_string(),
+        };
+        let url = if self.url.is_empty() && !self.doi.is_empty() {
+            format!("https://doi.org/{}", self.doi)
+        } else {
+            self.url.clone()
+        };
+        // (field, value, unbraced)
+        let mut fields: Vec<(&str, String, bool)> = vec![];
+        for (name, names) in [("author", &self.authors), ("editor", &self.editors)] {
+            if !names.is_empty() {
+                fields.push((name, escape(&names.join(" and ")), false));
+            }
+        }
+        fields.push(("title", escape(&self.title), false));
         for (name, value) in [
-            ("year", &self.year),
             (container, &self.container),
-            ("volume", &self.volume),
-            ("number", &self.number),
-            ("pages", &self.pages),
-            ("publisher", &self.publisher),
-            ("doi", &self.doi),
-            ("pmid", &self.pmid),
-            ("url", &self.url),
-            ("note", &self.note),
+            ("series", &self.series),
+            ("year", &self.year),
         ] {
             if !value.is_empty() {
-                fields.push((name, value.clone()));
+                fields.push((name, escape(value), false));
+            }
+        }
+        match self.month.trim().parse::<usize>() {
+            Ok(m @ 1..=12) => fields.push(("month", MONTHS[m - 1].into(), true)),
+            _ if !self.month.trim().is_empty() => {
+                fields.push(("month", escape(self.month.trim()), false))
+            }
+            _ => {}
+        }
+        for (name, value, raw) in [
+            ("volume", &self.volume, false),
+            ("number", &self.number, false),
+            ("pages", &pages, false),
+            ("publisher", &self.publisher, false),
+            ("isbn", &self.isbn, false),
+            ("issn", &self.issn, false),
+            ("doi", &self.doi, true),
+            ("pmid", &self.pmid, false),
+            ("url", &url, true),
+            ("urldate", &self.urldate, false),
+            ("note", &self.note, false),
+        ] {
+            if !value.is_empty() {
+                fields.push((name, if raw { value.clone() } else { escape(value) }, false));
             }
         }
         let body = fields
             .iter()
-            .map(|(k, v)| {
-                let raw = matches!(*k, "url" | "doi");
-                format!("  {k} = {{{}}}", if raw { v.clone() } else { escape(v) })
+            .map(|(k, v, bare)| {
+                if *bare {
+                    format!("  {k} = {v}")
+                } else {
+                    format!("  {k} = {{{v}}}")
+                }
             })
             .collect::<Vec<_>>()
             .join(",\n");
@@ -464,6 +666,9 @@ impl Source {
         if self.locator.starts_with("https://") || self.locator.starts_with("http://") {
             b.entry_type = "online".into();
             b.url = self.locator.clone();
+            // An article's own address names its DOI on most publisher sites.
+            b.doi = doi_in_url(&self.locator).unwrap_or_default();
+            b.urldate = self.retrieved_at.map(crate::civil_date).unwrap_or_default();
             b.origin = "web".into();
             return b;
         }
@@ -568,6 +773,8 @@ pub fn verify_candidate(
         b.entry_type = candidate.entry_type.clone();
     }
     b.note = String::new();
+    // A confirmed printed title is worth a fresh lookup, even if the file name found nothing.
+    b.looked_up = false;
     Some(b)
 }
 /// Keys for the given sources: frozen keys stay, the rest get a unique key from current
@@ -670,6 +877,112 @@ mod tests {
         assert!(t.contains("journal = {J. Affect. Disord.}"));
         assert!(t.contains("doi = {10.1000/x_y}"));
         assert_eq!(b.base_key(""), "muller2021mood");
+    }
+    #[test]
+    fn bibtex_entries_are_complete() {
+        let b = record::<BibInfo>(|b| {
+            b.entry_type = "incollection".into();
+            b.title = "Analytical approach".into();
+            b.authors = vec!["Ruiz, Ana".into()];
+            b.editors = vec!["Kim, Bo".into(), "Lee, Cy".into()];
+            b.container = "Neural Information Processing".into();
+            b.series = "Lecture Notes in Computer Science".into();
+            b.year = "2025".into();
+            b.month = "5".into();
+            b.pages = "201-9".into();
+            b.publisher = "Springer".into();
+            b.isbn = "9783032383976".into();
+            b.doi = "10.1007/978-3-032-38398-3_14".into();
+        });
+        assert_eq!(
+            b.bibtex("ruiz2025analytical"),
+            "@incollection{ruiz2025analytical,\n  author = {Ruiz, Ana},\n  editor = {Kim, Bo and Lee, Cy},\n  title = {Analytical approach},\n  booktitle = {Neural Information Processing},\n  series = {Lecture Notes in Computer Science},\n  year = {2025},\n  month = may,\n  pages = {201--209},\n  publisher = {Springer},\n  isbn = {9783032383976},\n  doi = {10.1007/978-3-032-38398-3_14},\n  url = {https://doi.org/10.1007/978-3-032-38398-3_14}\n}\n"
+        );
+        assert!(b.reference().contains(", 201–209."));
+        assert_eq!(page_range("S44–S50"), Some(("S44".into(), "S50".into())));
+        assert_eq!(page_range("119250"), None);
+        // A page that names no DOI keeps its own address and the day it was read.
+        let mut s = Source::new(
+            "A page".into(),
+            "".into(),
+            "https://example.org/a".into(),
+            Access::MetadataOnly,
+        );
+        s.retrieved_at = Some(1_760_400_000);
+        let w = s.derived_bib().bibtex("page");
+        assert!(
+            w.contains("url = {https://example.org/a}") && w.contains("urldate = {2025-10-14}")
+        );
+    }
+    #[test]
+    fn article_addresses_name_their_doi() {
+        for (url, doi) in [
+            (
+                "https://www.nature.com/articles/s42005-022-00950-y",
+                "10.1038/s42005-022-00950-y",
+            ),
+            (
+                "https://www.frontiersin.org/journals/computational-neuroscience/articles/10.3389/fncom.2022.866517/full",
+                "10.3389/fncom.2022.866517",
+            ),
+            (
+                "https://link.springer.com/chapter/10.1007/978-3-032-38398-3_14",
+                "10.1007/978-3-032-38398-3_14",
+            ),
+            (
+                "https://journals.plos.org/plosbiology/article?id=10.1371/journal.pbio.3003916",
+                "10.1371/journal.pbio.3003916",
+            ),
+            (
+                "https://journals.plos.org/plosone/article?id=10.1371%2Fjournal.pone.0123456&type=printable",
+                "10.1371/journal.pone.0123456",
+            ),
+            (
+                "https://onlinelibrary.wiley.com/doi/epdf/10.1111/bdi.13000",
+                "10.1111/bdi.13000",
+            ),
+            (
+                "https://www.biorxiv.org/content/10.1101/2023.01.02.522510v2.full.pdf",
+                "10.1101/2023.01.02.522510",
+            ),
+            (
+                "https://arxiv.org/abs/2301.12345v3",
+                "10.48550/arXiv.2301.12345",
+            ),
+            (
+                "https://arxiv.org/abs/math/0211159",
+                "10.48550/arXiv.math/0211159",
+            ),
+        ] {
+            assert_eq!(doi_in_url(url).as_deref(), Some(doi), "{url}");
+        }
+        assert_eq!(
+            doi_in_url("https://www.sciencedirect.com/science/article/pii/S0166223613000465"),
+            None
+        );
+        let s = Source::new(
+            "Emergence of multiple subnetworks".into(),
+            "".into(),
+            "https://www.nature.com/articles/s41598-024-80510-2".into(),
+            Access::MetadataOnly,
+        );
+        assert_eq!(s.derived_bib().doi, "10.1038/s41598-024-80510-2");
+    }
+    #[test]
+    fn looked_up_titles_must_be_the_same_title() {
+        let t = "Metastable oscillatory modes emerge from synchronization in the brain spacetime connectome";
+        assert!(same_title(t, &t.to_uppercase()));
+        assert!(same_title(&format!("{t} | Communications Physics"), t));
+        assert!(same_title(
+            "How critical is brain criticality? - ScienceDirect",
+            "How critical is brain criticality?"
+        ));
+        assert!(!same_title(
+            "Brain criticality",
+            "Brain criticality revisited in sleep"
+        ));
+        assert!(!same_title(t, "Metastable oscillatory modes"));
+        assert!(!same_title("Sleep", "Sleep"));
     }
     #[test]
     fn dois_and_legacy_pubmed_notes_are_read_without_guessing() {
