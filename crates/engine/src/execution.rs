@@ -824,7 +824,7 @@ impl RunExecutor<'_> {
         let cited = reader::cited_sources(run);
         if self.settings.search_enabled && !cited.is_empty() {
             self.emit("인용 문헌의 서지 정보 확인".into());
-            let deadline = self.deadline.min(Instant::now() + Duration::from_secs(40));
+            let deadline = self.deadline.min(Instant::now() + Duration::from_secs(60));
             let warnings = crate::search::enrich_bibliography(
                 &mut self.store.project.sources,
                 &cited,
@@ -897,6 +897,17 @@ impl RunExecutor<'_> {
                 {
                     s.bib = Some(b);
                 }
+            }
+            // A printed title the scribe confirmed can now find the full record and its DOI.
+            if self.settings.search_enabled && !bib_needed.is_empty() {
+                let deadline = self.deadline.min(Instant::now() + Duration::from_secs(30));
+                let warnings = crate::search::enrich_bibliography(
+                    &mut self.store.project.sources,
+                    &bib_needed,
+                    self.cancel,
+                    deadline,
+                );
+                self.run_mut().limitations.extend(warnings);
             }
             // Better metadata may give better keys; rename before the keys are frozen.
             let fresh = reader::citation_keys(&self.store.project, &cited);

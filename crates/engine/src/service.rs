@@ -124,8 +124,9 @@ impl Drop for Service {
         let _ = self.sender.send(Command::Shutdown);
     }
 }
-/// Complete authors and journal details of cited sources before they are frozen into a
-/// report (PubMed/Crossref, read-only). Skipped when literature search is off.
+/// Complete the bibliographic records (authors, journal details, DOI) of cited sources
+/// before they are exported (PubMed/Crossref/doi.org, read-only). Skipped when literature
+/// search is off.
 fn enrich(
     store: &mut Store,
     run_ids: &[String],
@@ -153,7 +154,7 @@ fn enrich(
         return;
     }
     let _ = updates.send(Event::Status("인용 문헌의 서지 정보 확인".into()));
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
     let before = store.project.sources.clone();
     let warnings =
         crate::search::enrich_bibliography(&mut store.project.sources, &cited, cancel, deadline);
